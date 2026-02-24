@@ -7,6 +7,8 @@
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
 #include <cstdint>
+#include <vector>
+#include <string>
 
 class GraphicsEngine
 {
@@ -20,6 +22,20 @@ public:
     void RenderFrame();
     void UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, float pitch);
 
+    struct MeshVertex
+    {
+        DirectX::XMFLOAT3 Position;
+        DirectX::XMFLOAT3 Normal;
+        DirectX::XMFLOAT2 TexC;
+    };
+
+    struct DrawItem
+    {
+        uint32_t IndexCount = 0;
+        uint32_t StartIndexLocation = 0;
+        uint32_t TextureSrvIndex = 1;  // index into cbvHeap (0 = CBV, 1+ = SRVs)
+    };
+
 private:
     bool InitDevice();
     bool InitCommandQueue();
@@ -28,7 +44,6 @@ private:
     bool InitBackBufferViews();
     bool InitDepthBuffer();
 
-    //part 3
     bool CompileShaders();
     bool CreateMesh();
     bool CreateConstantBuffer();
@@ -44,12 +59,6 @@ private:
 private:
     static constexpr uint32_t kNumFrameBuffers = 2;
 
-    struct MeshVertex
-    {
-        DirectX::XMFLOAT3 Position;
-        DirectX::XMFLOAT3 Normal;
-    };
-
     struct alignas(16) FrameConstants
     {
         DirectX::XMFLOAT4X4 ModelMatrix;
@@ -62,36 +71,37 @@ private:
         DirectX::XMFLOAT4 DiffuseColor;
         DirectX::XMFLOAT4 SpecularColor;
         float Shininess = 32.0f;
-        float _p2[3] = { 0,0,0 };
+        float _p2[3] = { 0, 0, 0 };
     };
 
     bool m_ready = false;
 
     HWND     m_windowHandle = nullptr;
-    uint32_t m_backbufferWidth  = 0;
+    uint32_t m_backbufferWidth = 0;
     uint32_t m_backbufferHeight = 0;
 
-    Microsoft::WRL::ComPtr<IDXGIFactory4>            m_dxgiFactory;
-    Microsoft::WRL::ComPtr<ID3D12Device>             m_d3dDevice;
+    Microsoft::WRL::ComPtr<IDXGIFactory4>             m_dxgiFactory;
+    Microsoft::WRL::ComPtr<ID3D12Device>              m_d3dDevice;
 
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue>       m_commandQueue;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>   m_commandAllocator;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue>        m_commandQueue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>    m_commandAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
 
     Microsoft::WRL::ComPtr<ID3D12Fence> m_gpuFence;
     uint64_t m_gpuFenceCounter = 0;
-    HANDLE   m_gpuFenceEvent   = nullptr;
+    HANDLE   m_gpuFenceEvent = nullptr;
 
-    Microsoft::WRL::ComPtr<IDXGISwapChain>       m_swapchain;
-    Microsoft::WRL::ComPtr<ID3D12Resource>       m_backBuffers[kNumFrameBuffers];
+    Microsoft::WRL::ComPtr<IDXGISwapChain>   m_swapchain;
+    Microsoft::WRL::ComPtr<ID3D12Resource>   m_backBuffers[kNumFrameBuffers];
     uint32_t m_activeBuffer = 0;
 
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_renderTargetHeap;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_depthHeap;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_constantHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_constantHeap;   // CBV + SRVs
 
     uint32_t m_rtvHandleSize = 0;
     uint32_t m_dsvHandleSize = 0;
+    uint32_t m_cbvSrvUavHandleSize = 0;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_depthBuffer;
 
@@ -104,7 +114,7 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> m_vertexShaderBlob;
     Microsoft::WRL::ComPtr<ID3DBlob> m_pixelShaderBlob;
 
-    D3D12_INPUT_ELEMENT_DESC m_vertexLayout[2]{};
+    D3D12_INPUT_ELEMENT_DESC m_vertexLayout[3]{};
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vbGpu;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_ibGpu;
@@ -112,8 +122,14 @@ private:
     D3D12_INDEX_BUFFER_VIEW  m_indexView{};
     uint32_t m_numIndices = 0;
 
+    // Textures (index 0 = 1x1 white fallback, 1+ = loaded from disk)
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_textures;
+
+    // Per-material draw calls
+    std::vector<DrawItem> m_drawItems;
+
     Microsoft::WRL::ComPtr<ID3D12Resource> m_constBuffer;
-    uint8_t* m_mappedCBData  = nullptr;
+    uint8_t* m_mappedCBData = nullptr;
     uint32_t m_cbAlignedSize = 0;
 
     DirectX::XMFLOAT4X4 m_worldMatrix{};

@@ -22,12 +22,18 @@ set_target_properties(Lab4 PROPERTIES WIN32_EXECUTABLE TRUE)
 target_link_libraries(Lab4 PRIVATE
     user32 gdi32
     dxgi d3d12 d3dcompiler dxguid
+    windowscodecs ole32
 )
 
-# Копирование шейдера в выходную директорию сборки
 add_custom_command(TARGET Lab4 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/CubeShader.hlsl"
         "$<TARGET_FILE_DIR:Lab4>/CubeShader.hlsl"
-    COMMENT "Copying CubeShader.hlsl to output directory"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/sponza.obj"
+        "$<TARGET_FILE_DIR:Lab4>/sponza.obj"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/sponza.mtl"
+        "$<TARGET_FILE_DIR:Lab4>/sponza.mtl"
+    COMMENT "Copying assets to output directory"
 )
