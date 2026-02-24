@@ -30,3 +30,18 @@ add_custom_command(TARGET software_renderer POST_BUILD
     "${CMAKE_SOURCE_DIR}/models"
     "$<TARGET_FILE_DIR:software_renderer>/models"
 )
+
+# Вспомогательный скрипт для условного копирования
+file(WRITE "${CMAKE_BINARY_DIR}/copy_if_exists.cmake"
+"if(EXISTS \"\${SRC}\")
+    execute_process(COMMAND \${CMAKE_COMMAND} -E copy \"\${SRC}\" \"\${DST}\")
+endif()
+")
+
+# Копируем output.png из папки сборки в корень проекта (если файл существует)
+add_custom_command(TARGET software_renderer POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DSRC="$<TARGET_FILE_DIR:software_renderer>/output.png"
+        -DDST="${CMAKE_SOURCE_DIR}/output.png"
+        -P "${CMAKE_BINARY_DIR}/copy_if_exists.cmake"
+)
