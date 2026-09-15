@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <algorithm>
+#include <cfloat>
 #include <wincodec.h>
 #include <objbase.h>
 #include <DirectXMath.h>
@@ -567,8 +568,8 @@ bool RenderingSystem::Setup(HWND hWnd, uint32_t w, uint32_t h)
     m_vp = { 0.0f, 0.0f, (float)m_backbufferWidth, (float)m_backbufferHeight, 0.0f, 1.0f };
     m_scissor = { 0, 0, (LONG)m_backbufferWidth, (LONG)m_backbufferHeight };
 
-    // Sponza очень большой в оригинале — масштабируем в 0.01
-    XMStoreFloat4x4(&m_worldMatrix, XMMatrixScaling(0.01f, 0.01f, 0.01f));
+    // Models are normalized into the shared world while loading.
+    XMStoreFloat4x4(&m_worldMatrix, XMMatrixIdentity());
 
     XMVECTOR eye = XMVectorSet(m_cameraPos.x, m_cameraPos.y, m_cameraPos.z, 1.0f);
     XMVECTOR target = XMVectorZero();
@@ -802,26 +803,47 @@ void RenderingSystem::RecordGeometryPass()
     const auto rtvs = m_gbuffer->ColorRtvs();
     const auto dsv = m_gbuffer->DepthDsv();
     m_commandList->OMSetRenderTargets(static_cast<UINT>(rtvs.size()), rtvs.data(), FALSE, &dsv);
-    m_commandList->SetPipelineState(m_geometryPso.Get());
-    m_commandList->SetGraphicsRootSignature(m_geometryRootSig.Get());
     ID3D12DescriptorHeap* heaps[] = { m_materialHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, heaps);
-    m_commandList->SetGraphicsRootConstantBufferView(0, m_constBuffer->GetGPUVirtualAddress());
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->IASetVertexBuffers(0, 1, &m_vertexView);
     m_commandList->IASetIndexBuffer(&m_indexView);
 
     const auto base = m_materialHeap->GetGPUDescriptorHandleForHeapStart();
-    for (const auto& item : m_drawItems)
+    if (m_showSponza)
     {
-        auto texture = base;
-        texture.ptr += static_cast<UINT64>(item.TextureSrvIndex) * m_cbvSrvUavHandleSize;
-        m_commandList->SetGraphicsRootDescriptorTable(1, texture);
-        const float material[5] = { item.DiffuseColor.x, item.DiffuseColor.y,
-            item.DiffuseColor.z, item.DiffuseColor.w, item.Shininess };
-        m_commandList->SetGraphicsRoot32BitConstants(2, 5, material, 0);
-        m_commandList->DrawIndexedInstanced(item.IndexCount, 1,
-            item.StartIndexLocation, 0, 0);
+        m_commandList->SetPipelineState(m_geometryPso.Get());
+        m_commandList->SetGraphicsRootSignature(m_geometryRootSig.Get());
+        m_commandList->SetGraphicsRootConstantBufferView(0, m_constBuffer->GetGPUVirtualAddress());
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        for (const auto& item : m_drawItems)
+        {
+            auto texture = base;
+            texture.ptr += static_cast<UINT64>(item.TextureSrvIndex) * m_cbvSrvUavHandleSize;
+            m_commandList->SetGraphicsRootDescriptorTable(1, texture);
+            const float material[5] = { item.DiffuseColor.x, item.DiffuseColor.y,
+                item.DiffuseColor.z, item.DiffuseColor.w, item.Shininess };
+            m_commandList->SetGraphicsRoot32BitConstants(2, 5, material, 0);
+            m_commandList->DrawIndexedInstanced(item.IndexCount, 1,
+                item.StartIndexLocation, 0, 0);
+        }
+    }
+
+    if (m_showDisplacementModel && m_tessellationIndexCount != 0)
+    {
+        m_commandList->SetPipelineState(
+            m_wireframe ? m_tessellationWireframePso.Get() : m_tessellationPso.Get());
+        m_commandList->SetGraphicsRootSignature(m_tessellationRootSig.Get());
+        m_commandList->SetGraphicsRootConstantBufferView(0, m_constBuffer->GetGPUVirtualAddress());
+        auto textures = base;
+        textures.ptr += static_cast<UINT64>(m_tessellationTextureSrvIndex) * m_cbvSrvUavHandleSize;
+        m_commandList->SetGraphicsRootDescriptorTable(1, textures);
+        const float tessellation[6] = { m_displacementScale, m_minTessellation,
+            m_maxTessellation, m_tessellationNearDistance, m_tessellationFarDistance,
+            m_useNormalMap ? 1.0f : 0.0f };
+        m_commandList->SetGraphicsRoot32BitConstants(2, 6, tessellation, 0);
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+        m_commandList->DrawIndexedInstanced(m_tessellationIndexCount, 1,
+            m_tessellationStartIndex, 0, 0);
     }
 }
 
@@ -954,6 +976,10 @@ bool RenderingSystem::CompileShaders()
 
     compile("GeometryVS", "vs_5_0", m_geometryVs);
     compile("GeometryPS", "ps_5_0", m_geometryPs);
+    compile("TessellationVS", "vs_5_0", m_tessellationVs);
+    compile("TessellationHS", "hs_5_0", m_tessellationHs);
+    compile("TessellationDS", "ds_5_0", m_tessellationDs);
+    compile("TessellationPS", "ps_5_0", m_tessellationPs);
     compile("FullscreenVS", "vs_5_0", m_fullscreenVs);
     compile("DirectionalPS", "ps_5_0", m_directionalPs);
     compile("LocalLightVS", "vs_5_0", m_localLightVs);
@@ -981,7 +1007,52 @@ bool RenderingSystem::CreateMesh()
     if (!ImportModelAssimp(objPath, model, importError))
         throw std::runtime_error("Assimp failed to load " + objPath + ": " + importError);
 
-    m_numIndices = (uint32_t)model.indices.size();
+    for (auto& vertex : model.vertices)
+    {
+        vertex.Position.x *= 0.01f;
+        vertex.Position.y *= 0.01f;
+        vertex.Position.z *= 0.01f;
+    }
+
+    const std::string mushroomPath = "assets/mushroom/AD_Mushroom_05_LOD5.fbx";
+    ImportedModel mushroom{};
+    importError.clear();
+    if (!ImportModelAssimp(mushroomPath, mushroom, importError))
+        throw std::runtime_error("Assimp failed to load " + mushroomPath + ": " + importError);
+
+    XMFLOAT3 boundsMin{ FLT_MAX, FLT_MAX, FLT_MAX };
+    XMFLOAT3 boundsMax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (const auto& vertex : mushroom.vertices)
+    {
+        boundsMin.x = std::min(boundsMin.x, vertex.Position.x);
+        boundsMin.y = std::min(boundsMin.y, vertex.Position.y);
+        boundsMin.z = std::min(boundsMin.z, vertex.Position.z);
+        boundsMax.x = std::max(boundsMax.x, vertex.Position.x);
+        boundsMax.y = std::max(boundsMax.y, vertex.Position.y);
+        boundsMax.z = std::max(boundsMax.z, vertex.Position.z);
+    }
+    const float mushroomHeight = std::max(boundsMax.y - boundsMin.y, 0.001f);
+    const float mushroomScale = 2.6f / mushroomHeight;
+    const XMFLOAT3 mushroomCenter{
+        (boundsMin.x + boundsMax.x) * 0.5f,
+        boundsMin.y,
+        (boundsMin.z + boundsMax.z) * 0.5f
+    };
+    for (auto& vertex : mushroom.vertices)
+    {
+        vertex.Position.x = (vertex.Position.x - mushroomCenter.x) * mushroomScale;
+        vertex.Position.y = (vertex.Position.y - mushroomCenter.y) * mushroomScale;
+        vertex.Position.z = (vertex.Position.z - mushroomCenter.z) * mushroomScale;
+    }
+
+    const uint32_t mushroomBaseVertex = static_cast<uint32_t>(model.vertices.size());
+    m_tessellationStartIndex = static_cast<uint32_t>(model.indices.size());
+    m_tessellationIndexCount = static_cast<uint32_t>(mushroom.indices.size());
+    model.vertices.insert(model.vertices.end(), mushroom.vertices.begin(), mushroom.vertices.end());
+    model.indices.reserve(model.indices.size() + mushroom.indices.size());
+    for (uint32_t index : mushroom.indices)
+        model.indices.push_back(mushroomBaseVertex + index);
+    m_numIndices = static_cast<uint32_t>(model.indices.size());
 
     // ── собираем список уникальных путей к текстурам ──────────────────────────
     std::unordered_map<std::string, uint32_t> pathToKey;
@@ -1003,6 +1074,12 @@ bool RenderingSystem::CreateMesh()
 
     for (const auto& part : model.parts)
         groupKey.push_back(getOrAddKey(part.diffuseTexture));
+
+    // These three entries must stay contiguous: t0 albedo, t1 normal, t2 displacement.
+    m_tessellationTextureSrvIndex = getOrAddKey(
+        "assets/mushroom/AD_Mushroom_05_4K_albedo_LOD5.jpg");
+    getOrAddKey("assets/mushroom/AD_Mushroom_05_4K_normal_LOD5.jpg");
+    getOrAddKey("assets/mushroom/AD_Mushroom_05_4K_displacement.jpg");
 
     // ── GPU-буферы для вершин и индексов ──────────────────────────────────────
     const UINT64 vbSize = (UINT64)model.vertices.size() * sizeof(MeshVertex);
@@ -1154,7 +1231,8 @@ bool RenderingSystem::CreateMesh()
         tb2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         tb2.Transition.pResource = m_textures[0].Get();
         tb2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         tb2.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         m_commandList->ResourceBarrier(1, &tb2);
 
@@ -1211,7 +1289,8 @@ bool RenderingSystem::CreateMesh()
         tb2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         tb2.Transition.pResource = m_textures[i + 1].Get();
         tb2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        tb2.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         tb2.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         m_commandList->ResourceBarrier(1, &tb2);
 
@@ -1395,7 +1474,7 @@ bool RenderingSystem::CreateRootSignatures()
     samp.MaxLOD = D3D12_FLOAT32_MAX;
     samp.ShaderRegister = 0;
     samp.RegisterSpace = 0;
-    samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     auto create = [&](D3D12_ROOT_PARAMETER* params, UINT count,
         D3D12_ROOT_SIGNATURE_FLAGS flags, ComPtr<ID3D12RootSignature>& result)
@@ -1432,6 +1511,23 @@ bool RenderingSystem::CreateRootSignatures()
     geometry[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     create(geometry, 3, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
         m_geometryRootSig);
+
+    D3D12_DESCRIPTOR_RANGE tessellationTextures{};
+    tessellationTextures.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    tessellationTextures.NumDescriptors = 3;
+    tessellationTextures.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER tessellation[3]{};
+    tessellation[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    tessellation[0].Descriptor.ShaderRegister = 0;
+    tessellation[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    tessellation[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    tessellation[1].DescriptorTable = { 1, &tessellationTextures };
+    tessellation[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    tessellation[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    tessellation[2].Constants = { 2, 0, 6 };
+    tessellation[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    create(tessellation, 3, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        m_tessellationRootSig);
 
     D3D12_DESCRIPTOR_RANGE gbufferRange{};
     gbufferRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1493,6 +1589,20 @@ bool RenderingSystem::CreatePipelines()
     geometry.SampleDesc.Count = 1;
     CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&geometry, IID_PPV_ARGS(&m_geometryPso)),
         "Create geometry-pass PSO");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC tessellation = geometry;
+    tessellation.pRootSignature = m_tessellationRootSig.Get();
+    tessellation.VS = { m_tessellationVs->GetBufferPointer(), m_tessellationVs->GetBufferSize() };
+    tessellation.HS = { m_tessellationHs->GetBufferPointer(), m_tessellationHs->GetBufferSize() };
+    tessellation.DS = { m_tessellationDs->GetBufferPointer(), m_tessellationDs->GetBufferSize() };
+    tessellation.PS = { m_tessellationPs->GetBufferPointer(), m_tessellationPs->GetBufferSize() };
+    tessellation.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+    CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&tessellation,
+        IID_PPV_ARGS(&m_tessellationPso)), "Create tessellation PSO");
+
+    tessellation.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&tessellation,
+        IID_PPV_ARGS(&m_tessellationWireframePso)), "Create wireframe tessellation PSO");
 
     D3D12_DEPTH_STENCIL_DESC noDepth{};
     noDepth.DepthEnable = FALSE;
@@ -1583,20 +1693,43 @@ void RenderingSystem::DrawImGui()
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::SetNextWindowPos(ImVec2(16.f, 16.f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(270.f, 0.f), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Texture settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    if (ImGui::Checkbox("Animate texture", &m_textureAnimationEnabled) &&
-        !m_textureAnimationEnabled)
+    ImGui::SetNextWindowPos(ImVec2(18.f, 18.f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340.f, 430.f), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Adaptive surface lab", nullptr);
+
+    if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        m_textureTime = 0.f;
+        ImGui::Checkbox("Sponza", &m_showSponza);
+        ImGui::SameLine(150.f);
+        ImGui::Checkbox("Mushroom", &m_showDisplacementModel);
+        if (ImGui::Checkbox("Move Sponza UVs", &m_textureAnimationEnabled) &&
+            !m_textureAnimationEnabled)
+            m_textureTime = 0.f;
     }
-    ImGui::TextDisabled("Tiling: %.1f x %.1f",
-        m_textureAnimationEnabled ? 2.f : 1.f,
-        m_textureAnimationEnabled ? 2.f : 1.f);
-    ImGui::TextDisabled("UV offset: %.2f, %.2f",
-        std::fmod(m_textureTime * 0.08f, 1.0f),
-        std::fmod(m_textureTime * 0.035f, 1.0f));
+
+    if (ImGui::CollapsingHeader("Surface", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::Checkbox("Wireframe mushroom", &m_wireframe);
+        ImGui::Checkbox("Use normal map", &m_useNormalMap);
+        ImGui::SliderFloat("Displacement", &m_displacementScale, 0.0f, 0.45f, "%.3f");
+    }
+
+    if (ImGui::CollapsingHeader("Distance tessellation", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::SliderFloat("Near level", &m_maxTessellation, 1.0f, 10.0f, "%.1f");
+        ImGui::SliderFloat("Far level", &m_minTessellation, 1.0f, 4.0f, "%.1f");
+        ImGui::SliderFloat("Near distance", &m_tessellationNearDistance, 0.5f, 10.0f, "%.1f m");
+        ImGui::SliderFloat("Far distance", &m_tessellationFarDistance, 5.0f, 40.0f, "%.1f m");
+        m_maxTessellation = std::max(m_maxTessellation, m_minTessellation);
+        m_tessellationFarDistance = std::max(
+            m_tessellationFarDistance, m_tessellationNearDistance + 0.5f);
+        const float cameraDistance = std::sqrt(m_cameraPos.x * m_cameraPos.x +
+            m_cameraPos.y * m_cameraPos.y + m_cameraPos.z * m_cameraPos.z);
+        ImGui::TextDisabled("Camera to model: %.1f m", cameraDistance);
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("RMB look  |  WASD move  |  Q/E vertical");
     ImGui::End();
 
     ImGui::Render();

@@ -17,6 +17,8 @@ cbuffer MaterialCB : register(b1)
 };
 
 Texture2D gMaterialTexture : register(t0);
+Texture2D gSurfaceNormal : register(t1);
+Texture2D gDisplacementMap : register(t2);
 Texture2D gAlbedoBuffer : register(t0);
 Texture2D gNormalBuffer : register(t1);
 Texture2D gDepthBuffer : register(t2);
@@ -68,6 +70,129 @@ GeometryTargets GeometryPS(GeometryVaryings input)
     GeometryTargets output;
     output.Albedo = float4(texel.rgb * gMaterialColor.rgb, 1.0f);
     output.Normal = float4(normalize(input.Normal), saturate(gMaterialShininess / 256.0f));
+    return output;
+}
+
+cbuffer TessellationCB : register(b2)
+{
+    float gDisplacementScale;
+    float gMinTessellation;
+    float gMaxTessellation;
+    float gTessellationNearDistance;
+    float gTessellationFarDistance;
+    float gUseNormalMap;
+};
+
+struct TessellationControlPoint
+{
+    float3 Position : POSITION;
+    float3 Normal : NORMAL;
+    float2 TexCoord : TEXCOORD;
+};
+
+TessellationControlPoint TessellationVS(GeometryInput input)
+{
+    TessellationControlPoint output;
+    output.Position = input.Position;
+    output.Normal = input.Normal;
+    output.TexCoord = input.TexCoord;
+    return output;
+}
+
+struct TessellationFactors
+{
+    float Edge[3] : SV_TessFactor;
+    float Inside : SV_InsideTessFactor;
+};
+
+float DistanceTessellation(float3 localPosition)
+{
+    float3 worldPosition = mul(float4(localPosition, 1.0f), gModel).xyz;
+    float distanceToCamera = distance(worldPosition, gCameraPosition);
+    float blend = smoothstep(gTessellationNearDistance,
+        gTessellationFarDistance, distanceToCamera);
+    return lerp(gMaxTessellation, gMinTessellation, blend);
+}
+
+TessellationFactors TessellationPatchConstants(
+    InputPatch<TessellationControlPoint, 3> patch, uint patchId : SV_PrimitiveID)
+{
+    TessellationFactors output;
+    output.Edge[0] = DistanceTessellation((patch[1].Position + patch[2].Position) * 0.5f);
+    output.Edge[1] = DistanceTessellation((patch[2].Position + patch[0].Position) * 0.5f);
+    output.Edge[2] = DistanceTessellation((patch[0].Position + patch[1].Position) * 0.5f);
+    output.Inside = (output.Edge[0] + output.Edge[1] + output.Edge[2]) / 3.0f;
+    return output;
+}
+
+[domain("tri")]
+[partitioning("fractional_odd")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("TessellationPatchConstants")]
+TessellationControlPoint TessellationHS(
+    InputPatch<TessellationControlPoint, 3> patch,
+    uint controlPointId : SV_OutputControlPointID,
+    uint patchId : SV_PrimitiveID)
+{
+    return patch[controlPointId];
+}
+
+struct TessellationVaryings
+{
+    float4 Position : SV_POSITION;
+    float3 WorldPosition : POSITION;
+    float3 Normal : NORMAL;
+    float2 TexCoord : TEXCOORD;
+};
+
+[domain("tri")]
+TessellationVaryings TessellationDS(TessellationFactors factors,
+    const OutputPatch<TessellationControlPoint, 3> patch,
+    float3 barycentric : SV_DomainLocation)
+{
+    TessellationVaryings output;
+    float3 localPosition = patch[0].Position * barycentric.x +
+        patch[1].Position * barycentric.y + patch[2].Position * barycentric.z;
+    float3 localNormal = normalize(patch[0].Normal * barycentric.x +
+        patch[1].Normal * barycentric.y + patch[2].Normal * barycentric.z);
+    float2 texCoord = patch[0].TexCoord * barycentric.x +
+        patch[1].TexCoord * barycentric.y + patch[2].TexCoord * barycentric.z;
+
+    float3 worldNormal = normalize(mul(localNormal, (float3x3)gModel));
+    float3 worldPosition = mul(float4(localPosition, 1.0f), gModel).xyz;
+    float height = gDisplacementMap.SampleLevel(gLinearWrap, texCoord, 0).r;
+    worldPosition += worldNormal * ((height - 0.5f) * gDisplacementScale);
+
+    output.Position = mul(float4(worldPosition, 1.0f), gViewProjection);
+    output.WorldPosition = worldPosition;
+    output.Normal = worldNormal;
+    output.TexCoord = texCoord;
+    return output;
+}
+
+GeometryTargets TessellationPS(TessellationVaryings input)
+{
+    float4 albedo = gMaterialTexture.Sample(gLinearWrap, input.TexCoord);
+    float3 normal = normalize(input.Normal);
+    if (gUseNormalMap > 0.5f)
+    {
+        float3 positionDx = ddx(input.WorldPosition);
+        float3 positionDy = ddy(input.WorldPosition);
+        float2 uvDx = ddx(input.TexCoord);
+        float2 uvDy = ddy(input.TexCoord);
+        float orientation = sign(uvDx.x * uvDy.y - uvDx.y * uvDy.x);
+        float3 tangent = normalize(positionDx * uvDy.y - positionDy * uvDx.y);
+        tangent = normalize(tangent - normal * dot(normal, tangent));
+        float3 bitangent = normalize(cross(normal, tangent)) * orientation;
+        float3 mappedNormal = gSurfaceNormal.Sample(gLinearWrap, input.TexCoord).xyz * 2.0f - 1.0f;
+        normal = normalize(tangent * mappedNormal.x + bitangent * mappedNormal.y +
+            normal * mappedNormal.z);
+    }
+
+    GeometryTargets output;
+    output.Albedo = float4(albedo.rgb, 1.0f);
+    output.Normal = float4(normal, 64.0f / 256.0f);
     return output;
 }
 

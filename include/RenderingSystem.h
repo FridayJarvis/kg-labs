@@ -124,12 +124,19 @@ private:
 
     std::unique_ptr<GBuffer> m_gbuffer;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_geometryRootSig;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_tessellationRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightingRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_tessellationPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_tessellationWireframePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_directionalPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_localLightPso;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_tessellationVs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_tessellationHs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_tessellationDs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_tessellationPs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_fullscreenVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_directionalPs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightVs;
@@ -141,6 +148,9 @@ private:
     D3D12_VERTEX_BUFFER_VIEW m_vertexView{};
     D3D12_INDEX_BUFFER_VIEW m_indexView{};
     uint32_t m_numIndices = 0;
+    uint32_t m_tessellationStartIndex = 0;
+    uint32_t m_tessellationIndexCount = 0;
+    uint32_t m_tessellationTextureSrvIndex = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_textures;
     std::vector<DrawItem> m_drawItems;
 
@@ -164,5 +174,14 @@ private:
     DirectX::XMFLOAT3 m_sunDirection{ 0.45f, -0.82f, 0.35f };
     float m_textureTime = 0.f;
     bool m_textureAnimationEnabled = false;
+    bool m_showSponza = true;
+    bool m_showDisplacementModel = true;
+    bool m_wireframe = false;
+    bool m_useNormalMap = true;
+    float m_displacementScale = 0.18f;
+    float m_minTessellation = 1.0f;
+    float m_maxTessellation = 6.0f;
+    float m_tessellationNearDistance = 2.0f;
+    float m_tessellationFarDistance = 18.0f;
     bool m_imguiReady = false;
 };

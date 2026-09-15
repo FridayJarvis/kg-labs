@@ -79,6 +79,9 @@ add_custom_command(TARGET Lab4 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/sponza.mtl"
         "$<TARGET_FILE_DIR:Lab4>/sponza.mtl"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+        "$<TARGET_FILE_DIR:Lab4>/assets"
     COMMENT "Copying assets to output directory"
 )
 
