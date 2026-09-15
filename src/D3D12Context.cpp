@@ -617,6 +617,12 @@ void RenderingSystem::Cleanup()
         m_mappedLightData = nullptr;
     }
 
+    if (m_instanceBuffer && m_mappedInstanceData)
+    {
+        m_instanceBuffer->Unmap(0, nullptr);
+        m_mappedInstanceData = nullptr;
+    }
+
     if (m_gpuFenceEvent)
     {
         CloseHandle(m_gpuFenceEvent);
@@ -749,6 +755,7 @@ void RenderingSystem::RenderFrame()
     if (!m_ready) return;
 
     DrawImGui();
+    UpdateInstanceVisibility();
     UploadConstants();
     UploadLights();
 
@@ -826,6 +833,24 @@ void RenderingSystem::RecordGeometryPass()
             m_commandList->DrawIndexedInstanced(item.IndexCount, 1,
                 item.StartIndexLocation, 0, 0);
         }
+    }
+
+    if (m_showInstanceField && m_visibleInstanceCount != 0)
+    {
+        m_commandList->SetPipelineState(m_instancedGeometryPso.Get());
+        m_commandList->SetGraphicsRootSignature(m_geometryRootSig.Get());
+        m_commandList->SetGraphicsRootConstantBufferView(0, m_constBuffer->GetGPUVirtualAddress());
+        auto texture = base;
+        texture.ptr += static_cast<UINT64>(m_tessellationTextureSrvIndex) * m_cbvSrvUavHandleSize;
+        m_commandList->SetGraphicsRootDescriptorTable(1, texture);
+        const float material[5] = { 0.82f, 0.92f, 0.78f, 1.0f, 48.0f };
+        m_commandList->SetGraphicsRoot32BitConstants(2, 5, material, 0);
+        const D3D12_VERTEX_BUFFER_VIEW views[] = { m_vertexView, m_instanceView };
+        m_commandList->IASetVertexBuffers(0, 2, views);
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_commandList->DrawIndexedInstanced(m_tessellationIndexCount,
+            m_visibleInstanceCount, m_tessellationStartIndex, 0, 0);
+        m_commandList->IASetVertexBuffers(0, 1, &m_vertexView);
     }
 
     if (m_showDisplacementModel && m_tessellationIndexCount != 0)
@@ -975,6 +1000,7 @@ bool RenderingSystem::CompileShaders()
     };
 
     compile("GeometryVS", "vs_5_0", m_geometryVs);
+    compile("InstanceGeometryVS", "vs_5_0", m_instancedGeometryVs);
     compile("GeometryPS", "ps_5_0", m_geometryPs);
     compile("TessellationVS", "vs_5_0", m_tessellationVs);
     compile("TessellationHS", "hs_5_0", m_tessellationHs);
@@ -991,6 +1017,15 @@ bool RenderingSystem::CompileShaders()
                            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
     m_vertexLayout[2] = { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24,
                            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
+
+    for (uint32_t i = 0; i < 3; ++i)
+        m_instancedVertexLayout[i] = m_vertexLayout[i];
+    for (uint32_t row = 0; row < 4; ++row)
+    {
+        m_instancedVertexLayout[3 + row] = { "INSTANCE_TRANSFORM", row,
+            DXGI_FORMAT_R32G32B32A32_FLOAT, 1, row * 16,
+            D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 };
+    }
 
     return true;
 }
@@ -1044,6 +1079,22 @@ bool RenderingSystem::CreateMesh()
         vertex.Position.y = (vertex.Position.y - mushroomCenter.y) * mushroomScale;
         vertex.Position.z = (vertex.Position.z - mushroomCenter.z) * mushroomScale;
     }
+
+    XMFLOAT3 prototypeMin{ FLT_MAX, FLT_MAX, FLT_MAX };
+    XMFLOAT3 prototypeMax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (const auto& vertex : mushroom.vertices)
+    {
+        prototypeMin.x = std::min(prototypeMin.x, vertex.Position.x);
+        prototypeMin.y = std::min(prototypeMin.y, vertex.Position.y);
+        prototypeMin.z = std::min(prototypeMin.z, vertex.Position.z);
+        prototypeMax.x = std::max(prototypeMax.x, vertex.Position.x);
+        prototypeMax.y = std::max(prototypeMax.y, vertex.Position.y);
+        prototypeMax.z = std::max(prototypeMax.z, vertex.Position.z);
+    }
+    BoundingBox prototypeBounds;
+    BoundingBox::CreateFromPoints(prototypeBounds,
+        XMLoadFloat3(&prototypeMin), XMLoadFloat3(&prototypeMax));
+    CreateInstanceField(prototypeBounds);
 
     const uint32_t mushroomBaseVertex = static_cast<uint32_t>(model.vertices.size());
     m_tessellationStartIndex = static_cast<uint32_t>(model.indices.size());
@@ -1336,6 +1387,163 @@ bool RenderingSystem::CreateMesh()
     return true;
 }
 
+void RenderingSystem::CreateInstanceField(const BoundingBox& prototypeBounds)
+{
+    constexpr uint32_t side = 40;
+    constexpr float spacing = 3.2f;
+    m_sceneInstances.clear();
+    m_sceneInstances.reserve(side * side);
+
+    auto noise01 = [](uint32_t value)
+    {
+        value ^= value >> 16;
+        value *= 0x7feb352du;
+        value ^= value >> 15;
+        value *= 0x846ca68bu;
+        value ^= value >> 16;
+        return static_cast<float>(value & 0xffffu) / 65535.0f;
+    };
+
+    for (uint32_t z = 0; z < side; ++z)
+    {
+        for (uint32_t x = 0; x < side; ++x)
+        {
+            const uint32_t seed = x + z * side;
+            const float jitterX = (noise01(seed * 3u + 1u) - 0.5f) * 1.25f;
+            const float jitterZ = (noise01(seed * 3u + 2u) - 0.5f) * 1.25f;
+            const float scale = 0.28f + noise01(seed * 3u + 3u) * 0.32f;
+            const float angle = noise01(seed * 5u + 7u) * XM_2PI;
+            const float px = (static_cast<float>(x) - (side - 1) * 0.5f) * spacing + jitterX;
+            const float pz = (static_cast<float>(z) - (side - 1) * 0.5f) * spacing + jitterZ;
+            const float py = -0.35f + 0.16f * std::sin(px * 0.17f) * std::cos(pz * 0.13f);
+
+            const XMMATRIX world = XMMatrixScaling(scale, scale, scale) *
+                XMMatrixRotationY(angle) * XMMatrixTranslation(px, py, pz);
+            SceneInstance instance{};
+            XMStoreFloat4x4(&instance.GpuData.World, world);
+            prototypeBounds.Transform(instance.Bounds, world);
+            m_sceneInstances.push_back(instance);
+        }
+    }
+
+    BoundingBox sceneBounds = m_sceneInstances.front().Bounds;
+    for (size_t i = 1; i < m_sceneInstances.size(); ++i)
+        BoundingBox::CreateMerged(sceneBounds, sceneBounds, m_sceneInstances[i].Bounds);
+    const float radius = std::max(sceneBounds.Extents.x,
+        std::max(sceneBounds.Extents.y, sceneBounds.Extents.z));
+    sceneBounds.Extents = { radius, radius, radius };
+    std::vector<uint32_t> objectIndices(m_sceneInstances.size());
+    for (uint32_t i = 0; i < static_cast<uint32_t>(objectIndices.size()); ++i)
+        objectIndices[i] = i;
+    m_spatialRoot = BuildSpatialNode(sceneBounds, objectIndices, 0);
+    m_visibleInstanceIndices.reserve(m_sceneInstances.size());
+}
+
+std::unique_ptr<RenderingSystem::SpatialNode> RenderingSystem::BuildSpatialNode(
+    const BoundingBox& bounds, const std::vector<uint32_t>& objects, uint32_t depth)
+{
+    auto node = std::make_unique<SpatialNode>();
+    node->Bounds = bounds;
+    if (objects.size() <= 20 || depth == 7)
+    {
+        node->Objects = objects;
+        return node;
+    }
+
+    const XMFLOAT3 half{ bounds.Extents.x * 0.5f,
+        bounds.Extents.y * 0.5f, bounds.Extents.z * 0.5f };
+    std::array<BoundingBox, 8> childBounds{};
+    std::array<std::vector<uint32_t>, 8> childObjects;
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+        const XMFLOAT3 offset{ (i & 1) ? half.x : -half.x,
+            (i & 2) ? half.y : -half.y, (i & 4) ? half.z : -half.z };
+        childBounds[i] = BoundingBox({ bounds.Center.x + offset.x,
+            bounds.Center.y + offset.y, bounds.Center.z + offset.z }, half);
+    }
+
+    for (uint32_t object : objects)
+    {
+        const auto& box = m_sceneInstances[object].Bounds;
+        const uint32_t child = (box.Center.x >= bounds.Center.x ? 1u : 0u) |
+            (box.Center.y >= bounds.Center.y ? 2u : 0u) |
+            (box.Center.z >= bounds.Center.z ? 4u : 0u);
+        if (childBounds[child].Contains(box) == CONTAINS)
+            childObjects[child].push_back(object);
+        else
+            node->Objects.push_back(object);
+    }
+    for (uint32_t i = 0; i < 8; ++i)
+        if (!childObjects[i].empty())
+            node->Children[i] = BuildSpatialNode(childBounds[i], childObjects[i], depth + 1);
+    return node;
+}
+
+void RenderingSystem::AppendSpatialNode(const SpatialNode& node)
+{
+    m_visibleInstanceIndices.insert(m_visibleInstanceIndices.end(),
+        node.Objects.begin(), node.Objects.end());
+    for (const auto& child : node.Children)
+        if (child) AppendSpatialNode(*child);
+}
+
+void RenderingSystem::QuerySpatialNode(const SpatialNode& node,
+    const BoundingFrustum& frustum, ContainmentType inherited)
+{
+    ++m_nodesVisited;
+    const ContainmentType relation = inherited == CONTAINS
+        ? CONTAINS : frustum.Contains(node.Bounds);
+    if (relation == DISJOINT) return;
+    if (relation == CONTAINS)
+    {
+        AppendSpatialNode(node);
+        return;
+    }
+    for (uint32_t object : node.Objects)
+        if (frustum.Contains(m_sceneInstances[object].Bounds) != DISJOINT)
+            m_visibleInstanceIndices.push_back(object);
+    for (const auto& child : node.Children)
+        if (child) QuerySpatialNode(*child, frustum, INTERSECTS);
+}
+
+void RenderingSystem::UpdateInstanceVisibility()
+{
+    m_visibleInstanceIndices.clear();
+    m_nodesVisited = 0;
+    if (!m_showInstanceField || m_sceneInstances.empty())
+    {
+        m_visibleInstanceCount = 0;
+        m_culledInstanceCount = 0;
+        return;
+    }
+
+    BoundingFrustum viewFrustum;
+    BoundingFrustum worldFrustum;
+    BoundingFrustum::CreateFromMatrix(viewFrustum, XMLoadFloat4x4(&m_projMatrix));
+    viewFrustum.Transform(worldFrustum,
+        XMMatrixInverse(nullptr, XMLoadFloat4x4(&m_viewMatrix)));
+
+    if (m_octreeCulling && m_spatialRoot)
+        QuerySpatialNode(*m_spatialRoot, worldFrustum, INTERSECTS);
+    else
+    {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_sceneInstances.size()); ++i)
+            if (!m_frustumCulling ||
+                worldFrustum.Contains(m_sceneInstances[i].Bounds) != DISJOINT)
+                m_visibleInstanceIndices.push_back(i);
+    }
+
+    m_visibleInstanceCount = static_cast<uint32_t>(m_visibleInstanceIndices.size());
+    m_culledInstanceCount = static_cast<uint32_t>(m_sceneInstances.size()) -
+        m_visibleInstanceCount;
+    if (m_mappedInstanceData)
+    {
+        auto* output = reinterpret_cast<InstanceVertex*>(m_mappedInstanceData);
+        for (uint32_t i = 0; i < m_visibleInstanceCount; ++i)
+            output[i] = m_sceneInstances[m_visibleInstanceIndices[i]].GpuData;
+    }
+}
+
 bool RenderingSystem::CreateLightVolume()
 {
     constexpr uint32_t rings = 16;
@@ -1405,6 +1613,20 @@ bool RenderingSystem::CreateFrameResources()
     D3D12_RANGE noRead{ 0, 0 };
     CheckHR(m_constBuffer->Map(0, &noRead, reinterpret_cast<void**>(&m_mappedCBData)),
         "Map Constant Buffer");
+
+    if (m_sceneInstances.empty())
+        throw std::runtime_error("The instance field was not generated.");
+    const UINT64 instanceBytes = sizeof(InstanceVertex) * m_sceneInstances.size();
+    const D3D12_RESOURCE_DESC instanceDesc = MakeBufferDesc(instanceBytes);
+    CheckHR(m_d3dDevice->CreateCommittedResource(&uploadHP, D3D12_HEAP_FLAG_NONE,
+        &instanceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&m_instanceBuffer)), "Create instance stream");
+    CheckHR(m_instanceBuffer->Map(0, &noRead,
+        reinterpret_cast<void**>(&m_mappedInstanceData)), "Map instance stream");
+    m_instanceView.BufferLocation = m_instanceBuffer->GetGPUVirtualAddress();
+    m_instanceView.SizeInBytes = static_cast<UINT>(instanceBytes);
+    m_instanceView.StrideInBytes = sizeof(InstanceVertex);
+    UpdateInstanceVisibility();
 
     if (m_textures.empty())
         throw std::runtime_error("No textures (expected at least the white fallback).");
@@ -1590,6 +1812,13 @@ bool RenderingSystem::CreatePipelines()
     CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&geometry, IID_PPV_ARGS(&m_geometryPso)),
         "Create geometry-pass PSO");
 
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC instancedGeometry = geometry;
+    instancedGeometry.VS = { m_instancedGeometryVs->GetBufferPointer(),
+        m_instancedGeometryVs->GetBufferSize() };
+    instancedGeometry.InputLayout = { m_instancedVertexLayout, 7 };
+    CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&instancedGeometry,
+        IID_PPV_ARGS(&m_instancedGeometryPso)), "Create instanced geometry PSO");
+
     D3D12_GRAPHICS_PIPELINE_STATE_DESC tessellation = geometry;
     tessellation.pRootSignature = m_tessellationRootSig.Get();
     tessellation.VS = { m_tessellationVs->GetBufferPointer(), m_tessellationVs->GetBufferSize() };
@@ -1694,17 +1923,33 @@ void RenderingSystem::DrawImGui()
     ImGui::NewFrame();
 
     ImGui::SetNextWindowPos(ImVec2(18.f, 18.f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(340.f, 430.f), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Adaptive surface lab", nullptr);
+    ImGui::SetNextWindowSize(ImVec2(365.f, 520.f), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Scene laboratory", nullptr);
 
     if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Checkbox("Sponza", &m_showSponza);
         ImGui::SameLine(150.f);
         ImGui::Checkbox("Mushroom", &m_showDisplacementModel);
+        ImGui::Checkbox("Scattered mushroom field", &m_showInstanceField);
         if (ImGui::Checkbox("Move Sponza UVs", &m_textureAnimationEnabled) &&
             !m_textureAnimationEnabled)
             m_textureTime = 0.f;
+    }
+
+    if (ImGui::CollapsingHeader("Visibility", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::Checkbox("Linear frustum test", &m_frustumCulling);
+        ImGui::Checkbox("Frustum test through octree", &m_octreeCulling);
+        const char* mode = m_octreeCulling ? "Octree" :
+            (m_frustumCulling ? "Linear scan" : "No culling");
+        ImGui::Text("Mode: %s", mode);
+        ImGui::Text("Submitted: %u / %u", m_visibleInstanceCount,
+            static_cast<uint32_t>(m_sceneInstances.size()));
+        ImGui::Text("Rejected: %u", m_culledInstanceCount);
+        if (m_octreeCulling)
+            ImGui::Text("Octree nodes checked: %u", m_nodesVisited);
+        ImGui::TextDisabled("All submitted objects use one instanced draw.");
     }
 
     if (ImGui::CollapsingHeader("Surface", ImGuiTreeNodeFlags_DefaultOpen))

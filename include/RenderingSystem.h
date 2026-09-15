@@ -3,6 +3,8 @@
 #include "GBuffer.h"
 
 #include <DirectXMath.h>
+#include <DirectXCollision.h>
+#include <array>
 #include <cstdint>
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -40,6 +42,24 @@ public:
         uint32_t TextureSrvIndex = 1;
         DirectX::XMFLOAT4 DiffuseColor{ 1.f, 1.f, 1.f, 1.f };
         float Shininess = 32.f;
+    };
+
+    struct InstanceVertex
+    {
+        DirectX::XMFLOAT4X4 World;
+    };
+
+    struct SceneInstance
+    {
+        InstanceVertex GpuData;
+        DirectX::BoundingBox Bounds;
+    };
+
+    struct SpatialNode
+    {
+        DirectX::BoundingBox Bounds;
+        std::vector<uint32_t> Objects;
+        std::array<std::unique_ptr<SpatialNode>, 8> Children;
     };
 
     enum class LocalLightType : int32_t { Point = 0, Spot = 1 };
@@ -85,6 +105,15 @@ private:
     bool CreateRootSignatures();
     bool CreatePipelines();
     bool CreateLightVolume();
+    void CreateInstanceField(const DirectX::BoundingBox& prototypeBounds);
+    std::unique_ptr<SpatialNode> BuildSpatialNode(
+        const DirectX::BoundingBox& bounds,
+        const std::vector<uint32_t>& objects, uint32_t depth);
+    void UpdateInstanceVisibility();
+    void QuerySpatialNode(const SpatialNode& node,
+        const DirectX::BoundingFrustum& frustum,
+        DirectX::ContainmentType inherited);
+    void AppendSpatialNode(const SpatialNode& node);
     bool InitImGui();
     void DrawImGui();
     void UploadConstants();
@@ -127,11 +156,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_tessellationRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightingRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_instancedGeometryPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_tessellationPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_tessellationWireframePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_directionalPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_localLightPso;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_instancedGeometryVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_tessellationVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_tessellationHs;
@@ -142,6 +173,7 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightPs;
     D3D12_INPUT_ELEMENT_DESC m_vertexLayout[3]{};
+    D3D12_INPUT_ELEMENT_DESC m_instancedVertexLayout[7]{};
 
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vbGpu;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_ibGpu;
@@ -166,6 +198,15 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_lightBuffer;
     uint8_t* m_mappedLightData = nullptr;
     std::vector<LocalLight> m_localLights;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_instanceBuffer;
+    uint8_t* m_mappedInstanceData = nullptr;
+    D3D12_VERTEX_BUFFER_VIEW m_instanceView{};
+    std::vector<SceneInstance> m_sceneInstances;
+    std::vector<uint32_t> m_visibleInstanceIndices;
+    std::unique_ptr<SpatialNode> m_spatialRoot;
+    uint32_t m_visibleInstanceCount = 0;
+    uint32_t m_culledInstanceCount = 0;
+    uint32_t m_nodesVisited = 0;
 
     DirectX::XMFLOAT4X4 m_worldMatrix{};
     DirectX::XMFLOAT4X4 m_viewMatrix{};
@@ -176,6 +217,9 @@ private:
     bool m_textureAnimationEnabled = false;
     bool m_showSponza = true;
     bool m_showDisplacementModel = true;
+    bool m_showInstanceField = true;
+    bool m_frustumCulling = true;
+    bool m_octreeCulling = false;
     bool m_wireframe = false;
     bool m_useNormalMap = true;
     float m_displacementScale = 0.18f;

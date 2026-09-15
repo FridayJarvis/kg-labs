@@ -57,6 +57,26 @@ GeometryVaryings GeometryVS(GeometryInput input)
     return output;
 }
 
+struct InstanceTransform
+{
+    float4 Row0 : INSTANCE_TRANSFORM0;
+    float4 Row1 : INSTANCE_TRANSFORM1;
+    float4 Row2 : INSTANCE_TRANSFORM2;
+    float4 Row3 : INSTANCE_TRANSFORM3;
+};
+
+GeometryVaryings InstanceGeometryVS(GeometryInput input, InstanceTransform instance)
+{
+    GeometryVaryings output;
+    const float4x4 world = float4x4(
+        instance.Row0, instance.Row1, instance.Row2, instance.Row3);
+    const float4 worldPosition = mul(float4(input.Position, 1.0f), world);
+    output.Position = mul(worldPosition, gViewProjection);
+    output.Normal = normalize(mul(input.Normal, (float3x3)world));
+    output.TexCoord = input.TexCoord;
+    return output;
+}
+
 struct GeometryTargets
 {
     float4 Albedo : SV_TARGET0;

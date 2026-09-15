@@ -38,7 +38,7 @@ bool Application::Init(HINSTANCE hInst, int cmdShow)
     m_inputMgr = new KeyboardMouse();
     m_inputMgr->Clear();
 
-    if (!m_wnd->Init(this, hInst, cmdShow, 1024, 768, L"D3D12 Assimp Materials"))
+    if (!m_wnd->Init(this, hInst, cmdShow, 1024, 768, L"D3D12 Spatial Visibility Lab"))
         return false;
 
     m_tickToSeconds = 1.0 / TimerFrequency();
