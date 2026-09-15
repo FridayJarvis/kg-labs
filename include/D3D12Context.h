@@ -21,6 +21,8 @@ public:
     void HandleResize(uint32_t w, uint32_t h);
     void RenderFrame();
     void UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, float pitch);
+    void UpdateAnimation(float deltaTime);
+    bool ProcessGuiMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     struct MeshVertex
     {
@@ -34,6 +36,8 @@ public:
         uint32_t IndexCount = 0;
         uint32_t StartIndexLocation = 0;
         uint32_t TextureSrvIndex = 1;  // index into cbvHeap (0 = CBV, 1+ = SRVs)
+        DirectX::XMFLOAT4 DiffuseColor{ 1.f, 1.f, 1.f, 1.f };
+        float Shininess = 32.f;
     };
 
 private:
@@ -49,6 +53,8 @@ private:
     bool CreateConstantBuffer();
     bool CreateRootSignature();
     bool CreatePipeline();
+    bool InitImGui();
+    void DrawImGui();
     void UploadConstants();
 
     void WaitForGpu();
@@ -72,6 +78,9 @@ private:
         DirectX::XMFLOAT4 SpecularColor;
         float Shininess = 32.0f;
         float _p2[3] = { 0, 0, 0 };
+
+        DirectX::XMFLOAT2 TextureTiling{ 2.f, 2.f };
+        DirectX::XMFLOAT2 TextureOffset{ 0.f, 0.f };
     };
 
     bool m_ready = false;
@@ -98,6 +107,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_renderTargetHeap;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_depthHeap;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_constantHeap;   // CBV + SRVs
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_imguiHeap;
 
     uint32_t m_rtvHandleSize = 0;
     uint32_t m_dsvHandleSize = 0;
@@ -137,4 +147,7 @@ private:
     DirectX::XMFLOAT4X4 m_projMatrix{};
     DirectX::XMFLOAT3   m_cameraPos{ 0.3f, 3.5f, -4.5f };
     DirectX::XMFLOAT3   m_sunDirection{ 0.7f, -0.6f, 0.3f };
+    float m_textureTime = 0.f;
+    bool m_textureAnimationEnabled = false;
+    bool m_imguiReady = false;
 };

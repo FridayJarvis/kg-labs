@@ -9,12 +9,24 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <filesystem>
+#include <algorithm>
 #include <wincodec.h>
 #include <objbase.h>
 #include <DirectXMath.h>
+#include <assimp/Importer.hpp>
+#include <assimp/material.h>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
+#include <imgui.h>
+#include <imgui_impl_dx12.h>
+#include <imgui_impl_win32.h>
 using namespace DirectX;
 
 using Microsoft::WRL::ComPtr;
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Утилиты путей
@@ -96,6 +108,58 @@ static bool LoadImageWIC(const std::wstring& filePath, WicImage& out)
     const UINT stride = w * 4;
     hr = conv->CopyPixels(nullptr, stride, (UINT)out.bgra.size(), out.bgra.data());
     return SUCCEEDED(hr);
+}
+
+// WIC does not ship with a TGA codec on every Windows installation.  The
+// assignment model uses uncompressed TGA files, so keep a tiny decoder here
+// and use WIC for PNG/JPEG/BMP and the other common formats.
+static bool LoadImageTGA(const std::string& filePath, WicImage& out)
+{
+    std::ifstream input(filePath, std::ios::binary);
+    std::array<uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size())) return false;
+
+    const uint8_t idLength = header[0];
+    const uint8_t imageType = header[2];
+    const uint32_t width = header[12] | (uint32_t(header[13]) << 8);
+    const uint32_t height = header[14] | (uint32_t(header[15]) << 8);
+    const uint8_t bitsPerPixel = header[16];
+    if (header[1] != 0 || imageType != 2 || width == 0 || height == 0 ||
+        (bitsPerPixel != 24 && bitsPerPixel != 32)) return false;
+
+    input.seekg(idLength, std::ios::cur);
+    const size_t sourceStride = size_t(width) * (bitsPerPixel / 8);
+    std::vector<uint8_t> source(sourceStride * height);
+    if (!input.read(reinterpret_cast<char*>(source.data()), source.size())) return false;
+
+    out.width = width;
+    out.height = height;
+    out.bgra.resize(size_t(width) * height * 4);
+    const bool topOrigin = (header[17] & 0x20) != 0;
+    const bool rightOrigin = (header[17] & 0x10) != 0;
+    const uint32_t sourcePixelSize = bitsPerPixel / 8;
+
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        const uint32_t sourceY = topOrigin ? y : height - 1 - y;
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            const uint32_t sourceX = rightOrigin ? width - 1 - x : x;
+            const uint8_t* s = source.data() + sourceY * sourceStride + sourceX * sourcePixelSize;
+            uint8_t* d = out.bgra.data() + (size_t(y) * width + x) * 4;
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = sourcePixelSize == 4 ? s[3] : 255;
+        }
+    }
+    return true;
+}
+
+static bool LoadImageFile(const std::string& filePath, WicImage& out)
+{
+    std::string ext = std::filesystem::path(filePath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext == ".tga" ? LoadImageTGA(filePath, out)
+                         : LoadImageWIC(std::filesystem::path(filePath).wstring(), out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,6 +428,98 @@ static bool LoadObjWithGroups(const std::string& objPath, ObjLoaded& out)
     return !out.vertices.empty() && !out.indices.empty();
 }
 
+struct ImportedModel
+{
+    struct Part
+    {
+        uint32_t start = 0;
+        uint32_t count = 0;
+        std::string diffuseTexture;
+        XMFLOAT4 diffuseColor{ 1.f, 1.f, 1.f, 1.f };
+        float shininess = 32.f;
+    };
+
+    std::vector<GraphicsEngine::MeshVertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<Part> parts;
+};
+
+static bool ImportModelAssimp(const std::string& modelPath, ImportedModel& out,
+                              std::string& error)
+{
+    Assimp::Importer importer;
+    const unsigned flags = aiProcess_Triangulate |
+        aiProcess_JoinIdenticalVertices |
+        aiProcess_GenSmoothNormals |
+        aiProcess_ImproveCacheLocality |
+        aiProcess_PreTransformVertices |
+        aiProcess_FlipUVs;
+
+    const aiScene* scene = importer.ReadFile(modelPath, flags);
+    if (!scene || !scene->HasMeshes())
+    {
+        error = importer.GetErrorString();
+        return false;
+    }
+
+    const std::filesystem::path modelDirectory =
+        std::filesystem::path(modelPath).parent_path();
+
+    for (unsigned meshIndex = 0; meshIndex < scene->mNumMeshes; ++meshIndex)
+    {
+        const aiMesh* mesh = scene->mMeshes[meshIndex];
+        const uint32_t baseVertex = static_cast<uint32_t>(out.vertices.size());
+
+        out.vertices.reserve(out.vertices.size() + mesh->mNumVertices);
+        for (unsigned i = 0; i < mesh->mNumVertices; ++i)
+        {
+            GraphicsEngine::MeshVertex vertex{};
+            vertex.Position = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z };
+            if (mesh->HasNormals())
+                vertex.Normal = { mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z };
+            else
+                vertex.Normal = { 0.f, 1.f, 0.f };
+            if (mesh->HasTextureCoords(0))
+                vertex.TexC = { mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y };
+            out.vertices.push_back(vertex);
+        }
+
+        ImportedModel::Part part{};
+        part.start = static_cast<uint32_t>(out.indices.size());
+        for (unsigned faceIndex = 0; faceIndex < mesh->mNumFaces; ++faceIndex)
+        {
+            const aiFace& face = mesh->mFaces[faceIndex];
+            for (unsigned i = 0; i < face.mNumIndices; ++i)
+                out.indices.push_back(baseVertex + face.mIndices[i]);
+        }
+        part.count = static_cast<uint32_t>(out.indices.size()) - part.start;
+
+        if (mesh->mMaterialIndex < scene->mNumMaterials)
+        {
+            const aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+            aiString textureName;
+            if (material->GetTexture(aiTextureType_DIFFUSE, 0, &textureName) == AI_SUCCESS)
+            {
+                const std::filesystem::path texturePath(textureName.C_Str());
+                if (!texturePath.string().starts_with("*"))
+                    part.diffuseTexture = (modelDirectory / texturePath).lexically_normal().string();
+            }
+
+            aiColor4D color;
+            if (material->Get(AI_MATKEY_COLOR_DIFFUSE, color) == AI_SUCCESS)
+                part.diffuseColor = { color.r, color.g, color.b, color.a };
+
+            float shininess = 0.f;
+            if (material->Get(AI_MATKEY_SHININESS, shininess) == AI_SUCCESS && shininess > 0.f)
+                part.shininess = shininess;
+        }
+
+        if (part.count != 0) out.parts.push_back(part);
+    }
+
+    return !out.vertices.empty() && !out.indices.empty();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  GraphicsEngine
 // ─────────────────────────────────────────────────────────────────────────────
@@ -429,6 +585,8 @@ bool GraphicsEngine::Setup(HWND hWnd, uint32_t w, uint32_t h)
     CreateConstantBuffer();
     CreateRootSignature();
     CreatePipeline();
+    if (!InitImGui())
+        throw std::runtime_error("Failed to initialize Dear ImGui");
 
     m_ready = true;
     return true;
@@ -437,6 +595,14 @@ bool GraphicsEngine::Setup(HWND hWnd, uint32_t w, uint32_t h)
 void GraphicsEngine::Cleanup()
 {
     if (m_commandQueue) WaitForGpu();
+
+    if (m_imguiReady)
+    {
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        m_imguiReady = false;
+    }
 
     if (m_constBuffer && m_mappedCBData)
     {
@@ -634,6 +800,8 @@ void GraphicsEngine::RenderFrame()
 {
     if (!m_ready) return;
 
+    DrawImGui();
+
     UploadConstants();
 
     CheckHR(m_commandAllocator->Reset(), "CmdAlloc Reset");
@@ -678,8 +846,18 @@ void GraphicsEngine::RenderFrame()
         srv.ptr += (UINT64)di.TextureSrvIndex * (UINT64)m_cbvSrvUavHandleSize;
         m_commandList->SetGraphicsRootDescriptorTable(1, srv);
 
+        const float materialConstants[5] = {
+            di.DiffuseColor.x, di.DiffuseColor.y, di.DiffuseColor.z, di.DiffuseColor.w,
+            di.Shininess
+        };
+        m_commandList->SetGraphicsRoot32BitConstants(2, 5, materialConstants, 0);
+
         m_commandList->DrawIndexedInstanced(di.IndexCount, 1, di.StartIndexLocation, 0, 0);
     }
+
+    ID3D12DescriptorHeap* imguiHeaps[] = { m_imguiHeap.Get() };
+    m_commandList->SetDescriptorHeaps(1, imguiHeaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_commandList.Get());
 
     D3D12_RESOURCE_BARRIER toPresent = toRT;
     toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -709,6 +887,20 @@ void GraphicsEngine::UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, float
     XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
     XMStoreFloat4x4(&m_viewMatrix, XMMatrixLookToLH(eye, forward, up));
+}
+
+void GraphicsEngine::UpdateAnimation(float deltaTime)
+{
+    if (!m_textureAnimationEnabled) return;
+
+    // Scroll diagonally and wrap periodically to avoid losing float precision.
+    m_textureTime = std::fmod(m_textureTime + std::max(deltaTime, 0.f), 20.f);
+}
+
+bool GraphicsEngine::ProcessGuiMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    return m_imguiReady &&
+        ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam) != 0;
 }
 
 void GraphicsEngine::WaitForGpu()
@@ -796,16 +988,16 @@ bool GraphicsEngine::CompileShaders()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CreateMesh — загружаем Sponza из OBJ
+//  CreateMesh — Assimp imports geometry, material assignments and UVs
 // ─────────────────────────────────────────────────────────────────────────────
 bool GraphicsEngine::CreateMesh()
 {
-    // Путь к OBJ: ../../ — два уровня вверх из директории сборки (build/Debug → корень проекта)
     const std::string objPath = "sponza.obj";
 
-    ObjLoaded model{};
-    if (!LoadObjWithGroups(objPath, model))
-        throw std::runtime_error("Failed to load OBJ: " + objPath);
+    ImportedModel model{};
+    std::string importError;
+    if (!ImportModelAssimp(objPath, model, importError))
+        throw std::runtime_error("Assimp failed to load " + objPath + ": " + importError);
 
     m_numIndices = (uint32_t)model.indices.size();
 
@@ -825,18 +1017,10 @@ bool GraphicsEngine::CreateMesh()
         };
 
     std::vector<uint32_t> groupKey;
-    groupKey.reserve(model.groups.size());
+    groupKey.reserve(model.parts.size());
 
-    for (const auto& g : model.groups)
-    {
-        std::string diffuse;
-        if (!g.mtl.empty())
-        {
-            auto it = model.mtlToDiffuse.find(g.mtl);
-            if (it != model.mtlToDiffuse.end()) diffuse = it->second;
-        }
-        groupKey.push_back(getOrAddKey(diffuse));
-    }
+    for (const auto& part : model.parts)
+        groupKey.push_back(getOrAddKey(part.diffuseTexture));
 
     // ── GPU-буферы для вершин и индексов ──────────────────────────────────────
     const UINT64 vbSize = (UINT64)model.vertices.size() * sizeof(MeshVertex);
@@ -905,7 +1089,7 @@ bool GraphicsEngine::CreateMesh()
     for (const auto& p : uniquePaths)
     {
         WicImage img{};
-        bool ok = LoadImageWIC(ToWStringAscii(p), img);
+        bool ok = LoadImageFile(p, img);
         loadedOk.push_back(ok);
 
         if (!ok)
@@ -1001,7 +1185,7 @@ bool GraphicsEngine::CreateMesh()
         if (!loadedOk[i]) continue;
 
         WicImage img{};
-        if (!LoadImageWIC(ToWStringAscii(uniquePaths[i]), img)) continue;
+        if (!LoadImageFile(uniquePaths[i], img)) continue;
 
         D3D12_RESOURCE_DESC td = Tex2DDesc(img.width, img.height, DXGI_FORMAT_B8G8R8A8_UNORM);
 
@@ -1068,16 +1252,18 @@ bool GraphicsEngine::CreateMesh()
 
     // ── DrawItem-ы ────────────────────────────────────────────────────────────
     m_drawItems.clear();
-    m_drawItems.reserve(model.groups.size());
+    m_drawItems.reserve(model.parts.size());
 
-    for (size_t gi = 0; gi < model.groups.size(); ++gi)
+    for (size_t gi = 0; gi < model.parts.size(); ++gi)
     {
-        const auto& g = model.groups[gi];
-        if (g.count == 0) continue;
+        const auto& part = model.parts[gi];
+        if (part.count == 0) continue;
 
         DrawItem di{};
-        di.StartIndexLocation = g.start;
-        di.IndexCount = g.count;
+        di.StartIndexLocation = part.start;
+        di.IndexCount = part.count;
+        di.DiffuseColor = part.diffuseColor;
+        di.Shininess = part.shininess;
 
         uint32_t key = groupKey[gi];
         uint32_t texResIdx = (key > 0 && key < (uint32_t)m_textures.size()) ? key : 0;
@@ -1167,7 +1353,7 @@ bool GraphicsEngine::CreateRootSignature()
     srvRange.RegisterSpace = 0;
     srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER params[2]{};
+    D3D12_ROOT_PARAMETER params[3]{};
 
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 1;
@@ -1178,6 +1364,13 @@ bool GraphicsEngine::CreateRootSignature()
     params[1].DescriptorTable.NumDescriptorRanges = 1;
     params[1].DescriptorTable.pDescriptorRanges = &srvRange;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    // Per-material tint and specular exponent are changed for each Assimp mesh.
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[2].Constants.ShaderRegister = 1;
+    params[2].Constants.RegisterSpace = 0;
+    params[2].Constants.Num32BitValues = 5;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC samp{};
     samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1193,7 +1386,7 @@ bool GraphicsEngine::CreateRootSignature()
     samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 2;
+    rsDesc.NumParameters = 3;
     rsDesc.pParameters = params;
     rsDesc.NumStaticSamplers = 1;
     rsDesc.pStaticSamplers = &samp;
@@ -1259,6 +1452,71 @@ bool GraphicsEngine::CreatePipeline()
     return true;
 }
 
+bool GraphicsEngine::InitImGui()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.NumDescriptors = 1;
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    CheckHR(m_d3dDevice->CreateDescriptorHeap(
+        &heapDesc, IID_PPV_ARGS(&m_imguiHeap)), "Create ImGui SRV heap");
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplDX12_InitInfo info{};
+    info.Device = m_d3dDevice.Get();
+    info.CommandQueue = m_commandQueue.Get();
+    info.NumFramesInFlight = kNumFrameBuffers;
+    info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    info.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    info.SrvDescriptorHeap = m_imguiHeap.Get();
+    info.LegacySingleSrvCpuDescriptor = m_imguiHeap->GetCPUDescriptorHandleForHeapStart();
+    info.LegacySingleSrvGpuDescriptor = m_imguiHeap->GetGPUDescriptorHandleForHeapStart();
+
+    if (!ImGui_ImplDX12_Init(&info))
+    {
+        ImGui::DestroyContext();
+        return false;
+    }
+    if (!ImGui_ImplWin32_Init(m_windowHandle))
+    {
+        ImGui_ImplDX12_Shutdown();
+        ImGui::DestroyContext();
+        return false;
+    }
+
+    m_imguiReady = true;
+    return true;
+}
+
+void GraphicsEngine::DrawImGui()
+{
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::SetNextWindowPos(ImVec2(16.f, 16.f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(270.f, 0.f), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Texture settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    if (ImGui::Checkbox("Animate texture", &m_textureAnimationEnabled) &&
+        !m_textureAnimationEnabled)
+    {
+        m_textureTime = 0.f;
+    }
+    ImGui::TextDisabled("Tiling: %.1f x %.1f",
+        m_textureAnimationEnabled ? 2.f : 1.f,
+        m_textureAnimationEnabled ? 2.f : 1.f);
+    ImGui::TextDisabled("UV offset: %.2f, %.2f",
+        std::fmod(m_textureTime * 0.08f, 1.0f),
+        std::fmod(m_textureTime * 0.035f, 1.0f));
+    ImGui::End();
+
+    ImGui::Render();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  UploadConstants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1285,6 +1543,19 @@ void GraphicsEngine::UploadConstants()
     fc.DiffuseColor = XMFLOAT4(0.90f, 0.90f, 0.90f, 1.0f);
     fc.SpecularColor = XMFLOAT4(0.90f, 0.90f, 0.90f, 1.0f);
     fc.Shininess = 64.0f;
+    if (m_textureAnimationEnabled)
+    {
+        fc.TextureTiling = XMFLOAT2(2.0f, 2.0f);
+        fc.TextureOffset = XMFLOAT2(
+            std::fmod(m_textureTime * 0.08f, 1.0f),
+            std::fmod(m_textureTime * 0.035f, 1.0f));
+    }
+    else
+    {
+        // Identity UV transform: display the material exactly as authored.
+        fc.TextureTiling = XMFLOAT2(1.0f, 1.0f);
+        fc.TextureOffset = XMFLOAT2(0.0f, 0.0f);
+    }
 
     std::memcpy(m_mappedCBData, &fc, sizeof(fc));
 }

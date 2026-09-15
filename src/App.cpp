@@ -38,7 +38,7 @@ bool Application::Init(HINSTANCE hInst, int cmdShow)
     m_inputMgr = new KeyboardMouse();
     m_inputMgr->Clear();
 
-    if (!m_wnd->Init(this, hInst, cmdShow, 1024, 768, L"D3D12 Cube"))
+    if (!m_wnd->Init(this, hInst, cmdShow, 1024, 768, L"D3D12 Assimp Materials"))
         return false;
 
     m_tickToSeconds = 1.0 / TimerFrequency();
@@ -92,6 +92,8 @@ void Application::Tick(float deltaTime)
         m_shouldClose = true;
 
     if (!m_inputMgr || !m_gfx) return;
+
+    m_gfx->UpdateAnimation(deltaTime);
 
     const bool rmb = m_inputMgr->IsPressed(VK_RBUTTON);
     if (rmb)
@@ -158,6 +160,9 @@ void Application::Tick(float deltaTime)
 
 LRESULT Application::ProcessMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (m_gfx && m_gfx->ProcessGuiMessage(hWnd, message, wParam, lParam))
+        return 1;
+
     switch (message)
     {
     case WM_CLOSE:
