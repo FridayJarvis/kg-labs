@@ -44,7 +44,7 @@ bool Application::Init(HINSTANCE hInst, int cmdShow)
     m_tickToSeconds = 1.0 / TimerFrequency();
     m_lastTimestamp = ReadTimer();
 
-    m_gfx = new GraphicsEngine();
+    m_gfx = new RenderingSystem();
 
     RECT rc{};
     GetClientRect(m_wnd->Handle(), &rc);

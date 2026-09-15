@@ -1,7 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <cstdint>
-#include "D3D12Context.h"
+#include "RenderingSystem.h"
 
 class AppWindow;
 class KeyboardMouse;
@@ -23,7 +23,7 @@ private:
 private:
     AppWindow*      m_wnd      = nullptr;
     KeyboardMouse*  m_inputMgr = nullptr;
-    GraphicsEngine* m_gfx      = nullptr;
+    RenderingSystem* m_gfx     = nullptr;
 
     bool m_shouldClose = false;
 

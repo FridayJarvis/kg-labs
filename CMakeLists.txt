@@ -11,6 +11,7 @@ add_executable(Lab4
     "src/Window.cpp"
     "src/KeyboardMouse.cpp"
     "src/D3D12Context.cpp"
+    "src/GBuffer.cpp"
 )
 
 set(KG_LABS_IMGUI_ROOT
@@ -70,8 +71,8 @@ set(KG_LABS_SPONZA_TEXTURE_DIR
 
 add_custom_command(TARGET Lab4 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/CubeShader.hlsl"
-        "$<TARGET_FILE_DIR:Lab4>/CubeShader.hlsl"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Deferred.hlsl"
+        "$<TARGET_FILE_DIR:Lab4>/Deferred.hlsl"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/sponza.obj"
         "$<TARGET_FILE_DIR:Lab4>/sponza.obj"
