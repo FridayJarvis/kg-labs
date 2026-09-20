@@ -437,12 +437,60 @@ struct ImportedModel
         std::string diffuseTexture;
         XMFLOAT4 diffuseColor{ 1.f, 1.f, 1.f, 1.f };
         float shininess = 32.f;
+        bool procedural = false;
     };
 
     std::vector<GraphicsEngine::MeshVertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<Part> parts;
 };
+
+// UV-sphere appended to the imported scene as one more "part". Coordinates are in
+// the model's own units (the world matrix scales everything by 0.01 later).
+static void AppendSphere(ImportedModel& out, XMFLOAT3 center, float radius,
+                         uint32_t slices, uint32_t stacks)
+{
+    const uint32_t baseVertex = static_cast<uint32_t>(out.vertices.size());
+
+    ImportedModel::Part part{};
+    part.start = static_cast<uint32_t>(out.indices.size());
+    part.shininess = 96.f;
+    part.procedural = true;
+
+    for (uint32_t i = 0; i <= stacks; ++i)
+    {
+        const float v = static_cast<float>(i) / stacks;
+        const float phi = v * XM_PI;
+        for (uint32_t j = 0; j <= slices; ++j)
+        {
+            const float u = static_cast<float>(j) / slices;
+            const float theta = u * XM_2PI;
+
+            const XMFLOAT3 n{ sinf(phi) * cosf(theta), cosf(phi), sinf(phi) * sinf(theta) };
+            GraphicsEngine::MeshVertex vertex{};
+            vertex.Position = { center.x + n.x * radius, center.y + n.y * radius,
+                                center.z + n.z * radius };
+            vertex.Normal = n;
+            vertex.TexC = { u, v };
+            out.vertices.push_back(vertex);
+        }
+    }
+
+    const uint32_t ring = slices + 1;
+    for (uint32_t i = 0; i < stacks; ++i)
+    {
+        for (uint32_t j = 0; j < slices; ++j)
+        {
+            const uint32_t a = baseVertex + i * ring + j;
+            const uint32_t b = a + ring;
+            // winding does not matter: back-face culling is disabled in the PSO
+            out.indices.insert(out.indices.end(), { a, b, a + 1, a + 1, b, b + 1 });
+        }
+    }
+
+    part.count = static_cast<uint32_t>(out.indices.size()) - part.start;
+    out.parts.push_back(part);
+}
 
 static bool ImportModelAssimp(const std::string& modelPath, ImportedModel& out,
                               std::string& error)
@@ -846,11 +894,11 @@ void GraphicsEngine::RenderFrame()
         srv.ptr += (UINT64)di.TextureSrvIndex * (UINT64)m_cbvSrvUavHandleSize;
         m_commandList->SetGraphicsRootDescriptorTable(1, srv);
 
-        const float materialConstants[5] = {
+        const float materialConstants[6] = {
             di.DiffuseColor.x, di.DiffuseColor.y, di.DiffuseColor.z, di.DiffuseColor.w,
-            di.Shininess
+            di.Shininess, di.ProceduralMode
         };
-        m_commandList->SetGraphicsRoot32BitConstants(2, 5, materialConstants, 0);
+        m_commandList->SetGraphicsRoot32BitConstants(2, 6, materialConstants, 0);
 
         m_commandList->DrawIndexedInstanced(di.IndexCount, 1, di.StartIndexLocation, 0, 0);
     }
@@ -891,6 +939,10 @@ void GraphicsEngine::UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, float
 
 void GraphicsEngine::UpdateAnimation(float deltaTime)
 {
+    // Voronoi feature points move as sin(t + phase): period 2*PI, so wrapping is seamless.
+    if (m_voronoiAnimationEnabled)
+        m_voronoiTime = std::fmod(m_voronoiTime + std::max(deltaTime, 0.f) * 0.8f, XM_2PI);
+
     if (!m_textureAnimationEnabled) return;
 
     // Scroll diagonally and wrap periodically to avoid losing float precision.
@@ -998,6 +1050,9 @@ bool GraphicsEngine::CreateMesh()
     std::string importError;
     if (!ImportModelAssimp(objPath, model, importError))
         throw std::runtime_error("Assimp failed to load " + objPath + ": " + importError);
+
+    // Procedural Voronoi ball floating in the middle of the atrium (~1.8 m above the floor).
+    AppendSphere(model, XMFLOAT3(0.f, 180.f, 0.f), 90.f, 96, 48);
 
     m_numIndices = (uint32_t)model.indices.size();
 
@@ -1264,6 +1319,7 @@ bool GraphicsEngine::CreateMesh()
         di.IndexCount = part.count;
         di.DiffuseColor = part.diffuseColor;
         di.Shininess = part.shininess;
+        di.ProceduralMode = part.procedural ? 1.f : 0.f;
 
         uint32_t key = groupKey[gi];
         uint32_t texResIdx = (key > 0 && key < (uint32_t)m_textures.size()) ? key : 0;
@@ -1369,7 +1425,7 @@ bool GraphicsEngine::CreateRootSignature()
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[2].Constants.ShaderRegister = 1;
     params[2].Constants.RegisterSpace = 0;
-    params[2].Constants.Num32BitValues = 5;
+    params[2].Constants.Num32BitValues = 6;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC samp{};
@@ -1514,6 +1570,13 @@ void GraphicsEngine::DrawImGui()
         std::fmod(m_textureTime * 0.035f, 1.0f));
     ImGui::End();
 
+    ImGui::SetNextWindowPos(ImVec2(16.f, 130.f), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Voronoi ball", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Checkbox("Animate cells", &m_voronoiAnimationEnabled);
+    ImGui::SliderFloat("Cell density", &m_voronoiScale, 1.f, 12.f, "%.1f");
+    ImGui::SliderFloat("Border width", &m_voronoiEdge, 0.01f, 0.30f, "%.2f");
+    ImGui::End();
+
     ImGui::Render();
 }
 
@@ -1556,6 +1619,10 @@ void GraphicsEngine::UploadConstants()
         fc.TextureTiling = XMFLOAT2(1.0f, 1.0f);
         fc.TextureOffset = XMFLOAT2(0.0f, 0.0f);
     }
+
+    fc.VoronoiTime = m_voronoiTime;
+    fc.VoronoiScale = m_voronoiScale;
+    fc.VoronoiEdge = m_voronoiEdge;
 
     std::memcpy(m_mappedCBData, &fc, sizeof(fc));
 }

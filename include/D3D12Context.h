@@ -38,6 +38,7 @@ public:
         uint32_t TextureSrvIndex = 1;  // index into cbvHeap (0 = CBV, 1+ = SRVs)
         DirectX::XMFLOAT4 DiffuseColor{ 1.f, 1.f, 1.f, 1.f };
         float Shininess = 32.f;
+        float ProceduralMode = 0.f;   // 0 = texture from disk, 1 = procedural Voronoi
     };
 
 private:
@@ -81,6 +82,11 @@ private:
 
         DirectX::XMFLOAT2 TextureTiling{ 2.f, 2.f };
         DirectX::XMFLOAT2 TextureOffset{ 0.f, 0.f };
+
+        float VoronoiTime = 0.f;
+        float VoronoiScale = 4.f;
+        float VoronoiEdge = 0.08f;
+        float _p3 = 0.f;
     };
 
     bool m_ready = false;
@@ -149,5 +155,11 @@ private:
     DirectX::XMFLOAT3   m_sunDirection{ 0.7f, -0.6f, 0.3f };
     float m_textureTime = 0.f;
     bool m_textureAnimationEnabled = false;
+
+    // Procedural Voronoi sphere
+    float m_voronoiTime = 0.f;
+    bool  m_voronoiAnimationEnabled = true;
+    float m_voronoiScale = 4.f;
+    float m_voronoiEdge = 0.08f;
     bool m_imguiReady = false;
 };
