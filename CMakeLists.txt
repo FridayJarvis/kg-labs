@@ -12,6 +12,7 @@ add_executable(Lab4
     "src/KeyboardMouse.cpp"
     "src/D3D12Context.cpp"
     "src/GBuffer.cpp"
+    "src/ParticleSystem.cpp"
 )
 
 set(KG_LABS_IMGUI_ROOT
@@ -73,6 +74,9 @@ add_custom_command(TARGET Lab4 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/Deferred.hlsl"
         "$<TARGET_FILE_DIR:Lab4>/Deferred.hlsl"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/Particle.hlsl"
+        "$<TARGET_FILE_DIR:Lab4>/Particle.hlsl"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/sponza.obj"
         "$<TARGET_FILE_DIR:Lab4>/sponza.obj"

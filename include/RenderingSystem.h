@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GBuffer.h"
+#include "ParticleSystem.h"
 
 #include <DirectXMath.h>
 #include <DirectXCollision.h>
@@ -163,6 +164,7 @@ private:
     D3D12_RECT m_scissor{};
 
     std::unique_ptr<GBuffer> m_gbuffer;
+    std::unique_ptr<ParticleSystem> m_particleSystem;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_geometryRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_tessellationRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightingRootSig;
@@ -243,6 +245,11 @@ private:
     DirectX::XMFLOAT3 m_cameraPos{ -4.f, 1.5f, -4.f };
     DirectX::XMFLOAT3 m_sunDirection{ 0.45f, -0.82f, 0.35f };
     float m_textureTime = 0.f;
+    float m_particleTime = 0.f;
+    float m_particleDeltaTime = 0.f;
+    DirectX::XMFLOAT3 m_particleEmitter{ 0.f, 0.4f, 0.f };
+    bool m_particlesEnabled = true;
+    bool m_particlesPaused = false;
     bool m_textureAnimationEnabled = false;
     bool m_showSponza = true;
     bool m_showGround = true;

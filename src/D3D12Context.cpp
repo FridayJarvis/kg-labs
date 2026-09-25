@@ -589,6 +589,8 @@ bool RenderingSystem::Setup(HWND hWnd, uint32_t w, uint32_t h)
     CreateShadowResources();
     CreateRootSignatures();
     CreatePipelines();
+    m_particleSystem = std::make_unique<ParticleSystem>();
+    m_particleSystem->Initialize(m_d3dDevice.Get());
     if (!InitImGui())
         throw std::runtime_error("Failed to initialize Dear ImGui");
 
@@ -599,6 +601,8 @@ bool RenderingSystem::Setup(HWND hWnd, uint32_t w, uint32_t h)
 void RenderingSystem::Cleanup()
 {
     if (m_commandQueue) WaitForGpu();
+
+    m_particleSystem.reset();
 
     if (m_imguiReady)
     {
@@ -789,6 +793,13 @@ void RenderingSystem::RenderFrame()
     m_commandList->RSSetViewports(1, &m_vp);
     m_commandList->RSSetScissorRects(1, &m_scissor);
     RecordGeometryPass();
+    if (m_particlesEnabled && m_particleSystem)
+    {
+        m_particleSystem->SetFrameData(m_viewMatrix, m_projMatrix, m_cameraPos,
+            m_particleEmitter, m_particleDeltaTime, m_particleTime);
+        m_particleSystem->Simulate(m_commandList.Get());
+        m_particleSystem->Draw(m_commandList.Get());
+    }
     m_gbuffer->BeginLighting(m_commandList.Get());
     RecordDirectionalPass(rtv);
     RecordLocalLightPass(rtv);
@@ -1109,10 +1120,17 @@ void RenderingSystem::UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, floa
 
 void RenderingSystem::UpdateAnimation(float deltaTime)
 {
-    if (!m_textureAnimationEnabled) return;
+    const float safeDeltaTime = std::max(deltaTime, 0.f);
+    m_particleDeltaTime = (m_particlesEnabled && !m_particlesPaused)
+        ? safeDeltaTime : 0.f;
+    if (m_particlesEnabled && !m_particlesPaused)
+        m_particleTime = std::fmod(m_particleTime + safeDeltaTime, 1000.f);
 
-    // Scroll diagonally and wrap periodically to avoid losing float precision.
-    m_textureTime = std::fmod(m_textureTime + std::max(deltaTime, 0.f), 20.f);
+    if (m_textureAnimationEnabled)
+    {
+        // Scroll diagonally and wrap periodically to avoid losing float precision.
+        m_textureTime = std::fmod(m_textureTime + safeDeltaTime, 20.f);
+    }
 }
 
 bool RenderingSystem::ProcessGuiMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -2322,6 +2340,16 @@ void RenderingSystem::DrawImGui()
         const float cameraDistance = std::sqrt(m_cameraPos.x * m_cameraPos.x +
             m_cameraPos.y * m_cameraPos.y + m_cameraPos.z * m_cameraPos.z);
         ImGui::TextDisabled("Camera to model: %.1f m", cameraDistance);
+    }
+
+    if (ImGui::CollapsingHeader("GPU particle vortex", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::Checkbox("Particles", &m_particlesEnabled);
+        ImGui::SameLine(150.f);
+        ImGui::Checkbox("Pause", &m_particlesPaused);
+        ImGui::SliderFloat3("Emitter", &m_particleEmitter.x, -5.0f, 5.0f, "%.1f");
+        ImGui::Text("Population: %u", ParticleSystem::ParticleCount);
+        ImGui::TextDisabled("Append/Consume buffers + compute + geometry shader");
     }
 
     if (ImGui::CollapsingHeader("Cascade shadows", ImGuiTreeNodeFlags_DefaultOpen))
