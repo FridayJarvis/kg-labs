@@ -29,6 +29,8 @@ public:
     D3D12_CPU_DESCRIPTOR_HANDLE DepthDsv() const;
     ID3D12DescriptorHeap* SrvHeap() const { return m_srvHeap.Get(); }
     D3D12_GPU_DESCRIPTOR_HANDLE SrvTable() const;
+    D3D12_GPU_DESCRIPTOR_HANDLE ShadowSrv() const;
+    void SetShadowMap(ID3D12Resource* shadowMap, uint32_t cascadeCount);
 
     static constexpr DXGI_FORMAT AlbedoFormat() { return DXGI_FORMAT_R8G8B8A8_UNORM; }
     static constexpr DXGI_FORMAT NormalFormat() { return DXGI_FORMAT_R16G16B16A16_FLOAT; }

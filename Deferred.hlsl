@@ -1,8 +1,11 @@
 cbuffer FrameCB : register(b0)
 {
     float4x4 gModel;
+    float4x4 gView;
     float4x4 gViewProjection;
     float4x4 gInverseViewProjection;
+    float4x4 gCascadeViewProjection[3];
+    float4 gCascadeSplits;
     float3 gCameraPosition; float gAmbient;
     float3 gDirectionalDirection; float gDirectionalIntensity;
     float3 gDirectionalColor; float gFramePadding;
@@ -14,6 +17,7 @@ cbuffer MaterialCB : register(b1)
 {
     float4 gMaterialColor;
     float gMaterialShininess;
+    uint gMaterialMode;
 };
 
 Texture2D gMaterialTexture : register(t0);
@@ -22,7 +26,9 @@ Texture2D gDisplacementMap : register(t2);
 Texture2D gAlbedoBuffer : register(t0);
 Texture2D gNormalBuffer : register(t1);
 Texture2D gDepthBuffer : register(t2);
+Texture2DArray gCascadeShadowMap : register(t4);
 SamplerState gLinearWrap : register(s0);
+SamplerComparisonState gShadowComparison : register(s1);
 
 struct LocalLight
 {
@@ -87,6 +93,12 @@ GeometryTargets GeometryPS(GeometryVaryings input)
 {
     float4 texel = gMaterialTexture.Sample(gLinearWrap, input.TexCoord);
     clip(texel.a - 0.1f);
+    if (gMaterialMode == 1)
+    {
+        const float checker = fmod(floor(input.TexCoord.x) + floor(input.TexCoord.y), 2.0f);
+        texel.rgb = lerp(float3(0.34f, 0.46f, 0.29f),
+            float3(0.16f, 0.24f, 0.14f), checker);
+    }
     GeometryTargets output;
     output.Albedo = float4(texel.rgb * gMaterialColor.rgb, 1.0f);
     output.Normal = float4(normalize(input.Normal), saturate(gMaterialShininess / 256.0f));
@@ -247,6 +259,39 @@ float3 Brdf(float3 albedo, float3 normal, float3 position, float3 toLight,
     return radiance * (albedo * diffuse + specular * 0.18f);
 }
 
+float CascadeShadow(float3 position, float3 normal, float3 toLight)
+{
+    const float viewDepth = mul(float4(position, 1.0f), gView).z;
+    uint cascade = viewDepth <= gCascadeSplits.x ? 0 :
+        (viewDepth <= gCascadeSplits.y ? 1 : 2);
+
+    const float4 lightPosition = mul(float4(position, 1.0f),
+        gCascadeViewProjection[cascade]);
+    const float3 ndc = lightPosition.xyz / lightPosition.w;
+    const float2 uv = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+    if (ndc.z <= 0.0f || ndc.z >= 1.0f || any(uv < 0.0f) || any(uv > 1.0f))
+        return 1.0f;
+
+    uint width, height, layers;
+    gCascadeShadowMap.GetDimensions(width, height, layers);
+    const float2 texel = 1.0f / float2(width, height);
+    const float slope = 1.0f - saturate(dot(normal, toLight));
+    const float bias = max(0.00025f, 0.00125f * slope);
+
+    float visibility = 0.0f;
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            visibility += gCascadeShadowMap.SampleCmpLevelZero(gShadowComparison,
+                float3(uv + float2(x, y) * texel, cascade), ndc.z - bias);
+        }
+    }
+    return visibility / 9.0f;
+}
+
 float4 DirectionalPS(ScreenVaryings input) : SV_TARGET
 {
     int3 pixel = int3(input.Position.xy, 0);
@@ -254,9 +299,11 @@ float4 DirectionalPS(ScreenVaryings input) : SV_TARGET
     if (albedo.a == 0.0f) discard;
     float4 packedNormal = gNormalBuffer.Load(pixel);
     float3 position = WorldPosition(input.Position.xy, gDepthBuffer.Load(pixel).r);
+    float3 normal = normalize(packedNormal.xyz);
     float3 lightDirection = normalize(-gDirectionalDirection);
+    float shadow = CascadeShadow(position, normal, lightDirection);
     float3 color = albedo.rgb * gAmbient;
-    color += Brdf(albedo.rgb, normalize(packedNormal.xyz), position, lightDirection,
+    color += shadow * Brdf(albedo.rgb, normal, position, lightDirection,
         gDirectionalColor * gDirectionalIntensity, packedNormal.a * 256.0f);
     return float4(color, 1.0f);
 }
@@ -305,4 +352,41 @@ float4 LocalLightPS(VolumeVaryings input) : SV_TARGET
     float3 color = Brdf(albedo.rgb, normalize(packedNormal.xyz), position, toLight,
         light.Color * light.Intensity * attenuation, packedNormal.a * 256.0f);
     return float4(color, 1.0f);
+}
+
+cbuffer ShadowPassCB : register(b3)
+{
+    float4x4 gShadowViewProjection;
+};
+
+cbuffer ShadowDrawCB : register(b4)
+{
+    uint gShadowUseInstancing;
+};
+
+struct ShadowInstance
+{
+    float4x4 World;
+};
+
+StructuredBuffer<ShadowInstance> gShadowInstances : register(t5);
+
+struct ShadowVaryings
+{
+    float4 Position : SV_POSITION;
+};
+
+ShadowVaryings ShadowVS(GeometryInput input, uint instanceId : SV_InstanceID)
+{
+    ShadowVaryings output;
+    const float4x4 identity = float4x4(
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1);
+    const float4x4 world = gShadowUseInstancing != 0
+        ? gShadowInstances[instanceId].World : identity;
+    const float4 worldPosition = mul(float4(input.Position, 1.0f), world);
+    output.Position = mul(worldPosition, gShadowViewProjection);
+    return output;
 }

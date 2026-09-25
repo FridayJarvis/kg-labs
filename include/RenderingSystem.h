@@ -42,6 +42,7 @@ public:
         uint32_t TextureSrvIndex = 1;
         DirectX::XMFLOAT4 DiffuseColor{ 1.f, 1.f, 1.f, 1.f };
         float Shininess = 32.f;
+        uint32_t MaterialMode = 0;
     };
 
     struct InstanceVertex
@@ -81,13 +82,20 @@ public:
 
 private:
     static constexpr uint32_t kNumFrameBuffers = 2;
+    static constexpr uint32_t kShadowCascadeCount = 3;
+    static constexpr uint32_t kShadowMapResolution = 2048;
+    static constexpr float kCameraNear = 0.5f;
+    static constexpr float kCameraFar = 180.0f;
 
     struct alignas(16) FrameConstants
     {
         DirectX::XMFLOAT4X4 Model;
+        DirectX::XMFLOAT4X4 View;
         DirectX::XMFLOAT4X4 ViewProjection;
         DirectX::XMFLOAT4X4 InverseViewProjection;
-        DirectX::XMFLOAT3 CameraPosition; float Ambient = 0.035f;
+        DirectX::XMFLOAT4X4 CascadeViewProjection[kShadowCascadeCount];
+        DirectX::XMFLOAT4 CascadeSplits{};
+        DirectX::XMFLOAT3 CameraPosition; float Ambient = 0.09f;
         DirectX::XMFLOAT3 DirectionalDirection; float DirectionalIntensity = 1.f;
         DirectX::XMFLOAT3 DirectionalColor{ 1.f, 0.96f, 0.88f }; float Padding0 = 0.f;
         DirectX::XMFLOAT2 TextureTiling{ 1.f, 1.f };
@@ -102,6 +110,7 @@ private:
     bool CompileShaders();
     bool CreateMesh();
     bool CreateFrameResources();
+    bool CreateShadowResources();
     bool CreateRootSignatures();
     bool CreatePipelines();
     bool CreateLightVolume();
@@ -118,6 +127,8 @@ private:
     void DrawImGui();
     void UploadConstants();
     void UploadLights();
+    void UpdateCascades();
+    void RecordShadowPass();
     void RecordGeometryPass();
     void RecordDirectionalPass(D3D12_CPU_DESCRIPTOR_HANDLE target);
     void RecordLocalLightPass(D3D12_CPU_DESCRIPTOR_HANDLE target);
@@ -155,12 +166,15 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_geometryRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_tessellationRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightingRootSig;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_shadowRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWireframePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_instancedGeometryPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_tessellationPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_tessellationWireframePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_directionalPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_localLightPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPso;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_instancedGeometryVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPs;
@@ -172,6 +186,7 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> m_directionalPs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightPs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_shadowVs;
     D3D12_INPUT_ELEMENT_DESC m_vertexLayout[3]{};
     D3D12_INPUT_ELEMENT_DESC m_instancedVertexLayout[7]{};
 
@@ -183,6 +198,8 @@ private:
     uint32_t m_tessellationStartIndex = 0;
     uint32_t m_tessellationIndexCount = 0;
     uint32_t m_tessellationTextureSrvIndex = 0;
+    uint32_t m_groundStartIndex = 0;
+    uint32_t m_groundIndexCount = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_textures;
     std::vector<DrawItem> m_drawItems;
 
@@ -201,12 +218,24 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_instanceBuffer;
     uint8_t* m_mappedInstanceData = nullptr;
     D3D12_VERTEX_BUFFER_VIEW m_instanceView{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_shadowInstanceBuffer;
+    uint8_t* m_mappedShadowInstanceData = nullptr;
     std::vector<SceneInstance> m_sceneInstances;
     std::vector<uint32_t> m_visibleInstanceIndices;
     std::unique_ptr<SpatialNode> m_spatialRoot;
     uint32_t m_visibleInstanceCount = 0;
     uint32_t m_culledInstanceCount = 0;
     uint32_t m_nodesVisited = 0;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_cascadeShadowMap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_shadowDsvHeap;
+    D3D12_RESOURCE_STATES m_shadowMapState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    uint32_t m_dsvHandleSize = 0;
+    D3D12_VIEWPORT m_shadowViewport{};
+    D3D12_RECT m_shadowScissor{};
+    std::array<DirectX::XMFLOAT4X4, kShadowCascadeCount> m_cascadeViewProjections{};
+    DirectX::XMFLOAT4 m_cascadeSplits{};
+    DirectX::BoundingBox m_sceneBounds{};
 
     DirectX::XMFLOAT4X4 m_worldMatrix{};
     DirectX::XMFLOAT4X4 m_viewMatrix{};
@@ -216,6 +245,7 @@ private:
     float m_textureTime = 0.f;
     bool m_textureAnimationEnabled = false;
     bool m_showSponza = true;
+    bool m_showGround = true;
     bool m_showDisplacementModel = true;
     bool m_showInstanceField = true;
     bool m_frustumCulling = true;

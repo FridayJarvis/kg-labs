@@ -63,7 +63,10 @@ void GBuffer::CreateHeaps()
 
     D3D12_DESCRIPTOR_HEAP_DESC srv{};
     srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srv.NumDescriptors = kShaderTargetCount;
+    // The fourth slot is reserved for the cascaded shadow-map array.  Keeping
+    // it in this heap lets the lighting pass bind all sampled textures through
+    // the single shader-visible CBV/SRV/UAV heap allowed by D3D12.
+    srv.NumDescriptors = kShaderTargetCount + 1;
     srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Require(m_device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&m_srvHeap)), "Create G-buffer SRV heap");
 }
@@ -181,4 +184,29 @@ D3D12_CPU_DESCRIPTOR_HANDLE GBuffer::DepthDsv() const
 D3D12_GPU_DESCRIPTOR_HANDLE GBuffer::SrvTable() const
 {
     return m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GBuffer::ShadowSrv() const
+{
+    auto handle = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(kShaderTargetCount) * m_srvStride;
+    return handle;
+}
+
+void GBuffer::SetShadowMap(ID3D12Resource* shadowMap, uint32_t cascadeCount)
+{
+    if (!m_device || !m_srvHeap || !shadowMap || cascadeCount == 0) return;
+
+    auto handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(kShaderTargetCount) * m_srvStride;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Format = DXGI_FORMAT_R32_FLOAT;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray.MostDetailedMip = 0;
+    view.Texture2DArray.MipLevels = 1;
+    view.Texture2DArray.FirstArraySlice = 0;
+    view.Texture2DArray.ArraySize = cascadeCount;
+    m_device->CreateShaderResourceView(shadowMap, &view, handle);
 }
