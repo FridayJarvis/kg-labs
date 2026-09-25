@@ -587,6 +587,7 @@ bool RenderingSystem::Setup(HWND hWnd, uint32_t w, uint32_t h)
     CreateLightVolume();
     CreateFrameResources();
     CreateShadowResources();
+    CreatePostProcessResources();
     CreateRootSignatures();
     CreatePipelines();
     m_particleSystem = std::make_unique<ParticleSystem>();
@@ -700,7 +701,7 @@ bool RenderingSystem::InitSwapChain()
 bool RenderingSystem::InitHeaps()
 {
     D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
-    rtvDesc.NumDescriptors = kNumFrameBuffers;
+    rtvDesc.NumDescriptors = kNumFrameBuffers + 1 + GBuffer::kExposureCount;
     rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     CheckHR(m_d3dDevice->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&m_renderTargetHeap)),
@@ -742,6 +743,7 @@ void RenderingSystem::HandleResize(uint32_t w, uint32_t h)
 
     InitBackBufferViews();
     m_gbuffer->Resize(w, h);
+    CreatePostProcessResources();
 
     m_vp = { 0.0f, 0.0f, (float)m_backbufferWidth, (float)m_backbufferHeight, 0.0f, 1.0f };
     m_scissor = { 0, 0, (LONG)m_backbufferWidth, (LONG)m_backbufferHeight };
@@ -757,6 +759,22 @@ D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::GetActiveRTV() const
     D3D12_CPU_DESCRIPTOR_HANDLE h = m_renderTargetHeap->GetCPUDescriptorHandleForHeapStart();
     h.ptr += (size_t)m_activeBuffer * m_rtvHandleSize;
     return h;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::GetSceneColorRTV() const
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle =
+        m_renderTargetHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(kNumFrameBuffers) * m_rtvHandleSize;
+    return handle;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::GetExposureRTV(uint32_t index) const
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle =
+        m_renderTargetHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(kNumFrameBuffers + 1 + index) * m_rtvHandleSize;
+    return handle;
 }
 
 ID3D12Resource* RenderingSystem::GetActiveBackBuffer() const
@@ -786,8 +804,19 @@ void RenderingSystem::RenderFrame()
     m_commandList->ResourceBarrier(1, &toRT);
 
     auto rtv = GetActiveRTV();
+    auto sceneRtv = GetSceneColorRTV();
     const float bgColor[4] = { 0.008f, 0.012f, 0.025f, 1.0f };
     m_commandList->ClearRenderTargetView(rtv, bgColor, 0, nullptr);
+
+    D3D12_RESOURCE_BARRIER sceneToRenderTarget{};
+    sceneToRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    sceneToRenderTarget.Transition.pResource = m_sceneColor.Get();
+    sceneToRenderTarget.Transition.StateBefore = m_sceneColorState;
+    sceneToRenderTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    sceneToRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &sceneToRenderTarget);
+    m_sceneColorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    m_commandList->ClearRenderTargetView(sceneRtv, bgColor, 0, nullptr);
 
     RecordShadowPass();
     m_commandList->RSSetViewports(1, &m_vp);
@@ -801,8 +830,16 @@ void RenderingSystem::RenderFrame()
         m_particleSystem->Draw(m_commandList.Get());
     }
     m_gbuffer->BeginLighting(m_commandList.Get());
-    RecordDirectionalPass(rtv);
-    RecordLocalLightPass(rtv);
+    RecordDirectionalPass(sceneRtv);
+    RecordLocalLightPass(sceneRtv);
+
+    D3D12_RESOURCE_BARRIER sceneToShader = sceneToRenderTarget;
+    sceneToShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    sceneToShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &sceneToShader);
+    m_sceneColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    RecordEyeAdaptationPass();
+    RecordPostProcessPass(rtv);
 
     ID3D12DescriptorHeap* imguiHeaps[] = { m_imguiHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, imguiHeaps);
@@ -915,6 +952,19 @@ void RenderingSystem::UpdateCascades()
             XMMatrixTranspose(lightView * lightProjection));
     }
 }
+
+struct PostProcessSettings
+{
+    uint32_t EyeAdaptationEnabled;
+    uint32_t VignetteEnabled;
+    float ExposureKey;
+    float VignetteStrength;
+    float VignetteInnerRadius;
+    float VignetteOuterRadius;
+    float DeltaTime;
+    uint32_t ResetExposure;
+};
+static_assert(sizeof(PostProcessSettings) == sizeof(uint32_t) * 8);
 
 void RenderingSystem::RecordShadowPass()
 {
@@ -1104,6 +1154,88 @@ void RenderingSystem::RecordLocalLightPass(D3D12_CPU_DESCRIPTOR_HANDLE target)
         static_cast<UINT>(m_localLights.size()), 0, 0, 0);
 }
 
+void RenderingSystem::RecordEyeAdaptationPass()
+{
+    const uint32_t writeIndex = m_exposureWriteIndex;
+    const uint32_t previousIndex = (writeIndex + 1) % GBuffer::kExposureCount;
+
+    const PostProcessSettings settings{
+        m_eyeAdaptationEnabled ? 1u : 0u,
+        m_vignetteEnabled ? 1u : 0u,
+        m_exposureKey,
+        m_vignetteStrength,
+        m_vignetteInnerRadius,
+        m_vignetteOuterRadius,
+        m_frameDeltaTime,
+        m_resetExposure ? 1u : 0u
+    };
+
+    D3D12_RESOURCE_BARRIER toRenderTarget{};
+    toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toRenderTarget.Transition.pResource = m_exposureMaps[writeIndex].Get();
+    toRenderTarget.Transition.StateBefore = m_exposureStates[writeIndex];
+    toRenderTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &toRenderTarget);
+    m_exposureStates[writeIndex] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    const D3D12_VIEWPORT exposureViewport{ 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+    const D3D12_RECT exposureScissor{ 0, 0, 1, 1 };
+    m_commandList->RSSetViewports(1, &exposureViewport);
+    m_commandList->RSSetScissorRects(1, &exposureScissor);
+    const auto exposureRtv = GetExposureRTV(writeIndex);
+    m_commandList->OMSetRenderTargets(1, &exposureRtv, TRUE, nullptr);
+    m_commandList->SetPipelineState(m_eyeAdaptationPso.Get());
+    m_commandList->SetGraphicsRootSignature(m_postProcessRootSig.Get());
+    ID3D12DescriptorHeap* heaps[] = { m_gbuffer->SrvHeap() };
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_commandList->SetGraphicsRootDescriptorTable(0, m_gbuffer->SrvTable());
+    m_commandList->SetGraphicsRootDescriptorTable(1, m_gbuffer->ExposureSrv(previousIndex));
+    m_commandList->SetGraphicsRoot32BitConstants(2, 8, &settings, 0);
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->IASetVertexBuffers(0, 0, nullptr);
+    m_commandList->IASetIndexBuffer(nullptr);
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    D3D12_RESOURCE_BARRIER toShaderResource = toRenderTarget;
+    toShaderResource.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toShaderResource.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &toShaderResource);
+    m_exposureStates[writeIndex] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->RSSetViewports(1, &m_vp);
+    m_commandList->RSSetScissorRects(1, &m_scissor);
+    m_resetExposure = false;
+}
+
+void RenderingSystem::RecordPostProcessPass(D3D12_CPU_DESCRIPTOR_HANDLE target)
+{
+    const PostProcessSettings settings{
+        m_eyeAdaptationEnabled ? 1u : 0u,
+        m_vignetteEnabled ? 1u : 0u,
+        m_exposureKey,
+        m_vignetteStrength,
+        m_vignetteInnerRadius,
+        m_vignetteOuterRadius,
+        m_frameDeltaTime,
+        0u
+    };
+
+    m_commandList->OMSetRenderTargets(1, &target, TRUE, nullptr);
+    m_commandList->SetPipelineState(m_postProcessPso.Get());
+    m_commandList->SetGraphicsRootSignature(m_postProcessRootSig.Get());
+    ID3D12DescriptorHeap* heaps[] = { m_gbuffer->SrvHeap() };
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_commandList->SetGraphicsRootDescriptorTable(0, m_gbuffer->SrvTable());
+    m_commandList->SetGraphicsRootDescriptorTable(
+        1, m_gbuffer->ExposureSrv(m_exposureWriteIndex));
+    m_commandList->SetGraphicsRoot32BitConstants(2, 8, &settings, 0);
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->IASetVertexBuffers(0, 0, nullptr);
+    m_commandList->IASetIndexBuffer(nullptr);
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+    m_exposureWriteIndex = (m_exposureWriteIndex + 1) % GBuffer::kExposureCount;
+}
+
 void RenderingSystem::UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, float pitch)
 {
     m_cameraPos = pos;
@@ -1121,6 +1253,7 @@ void RenderingSystem::UpdateCamera(const DirectX::XMFLOAT3& pos, float yaw, floa
 void RenderingSystem::UpdateAnimation(float deltaTime)
 {
     const float safeDeltaTime = std::max(deltaTime, 0.f);
+    m_frameDeltaTime = safeDeltaTime;
     m_particleDeltaTime = (m_particlesEnabled && !m_particlesPaused)
         ? safeDeltaTime : 0.f;
     if (m_particlesEnabled && !m_particlesPaused)
@@ -1192,16 +1325,22 @@ bool RenderingSystem::CompileShaders()
     flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-    auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& output)
+    auto compileFile = [&](const wchar_t* file, const char* entry, const char* target,
+        ComPtr<ID3DBlob>& output)
     {
         ComPtr<ID3DBlob> errors;
-        const HRESULT hr = D3DCompileFromFile(L"Deferred.hlsl", nullptr,
+        const HRESULT hr = D3DCompileFromFile(file, nullptr,
             D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, target, flags, 0, &output, &errors);
         if (FAILED(hr))
         {
             if (errors) throw std::runtime_error(static_cast<const char*>(errors->GetBufferPointer()));
             CheckHR(hr, entry);
         }
+    };
+
+    auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& output)
+    {
+        compileFile(L"Deferred.hlsl", entry, target, output);
     };
 
     compile("GeometryVS", "vs_5_0", m_geometryVs);
@@ -1216,6 +1355,8 @@ bool RenderingSystem::CompileShaders()
     compile("LocalLightVS", "vs_5_0", m_localLightVs);
     compile("LocalLightPS", "ps_5_0", m_localLightPs);
     compile("ShadowVS", "vs_5_0", m_shadowVs);
+    compileFile(L"PostProcess.hlsl", "ExposurePS", "ps_5_0", m_eyeAdaptationPs);
+    compileFile(L"PostProcess.hlsl", "PostProcessPS", "ps_5_0", m_postProcessPs);
 
     m_vertexLayout[0] = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0,
                            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 };
@@ -1987,6 +2128,51 @@ bool RenderingSystem::CreateShadowResources()
     return true;
 }
 
+bool RenderingSystem::CreatePostProcessResources()
+{
+    m_sceneColor.Reset();
+
+    D3D12_RESOURCE_DESC texture = Tex2DDesc(
+        m_backbufferWidth, m_backbufferHeight, kSceneColorFormat);
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = kSceneColorFormat;
+    clear.Color[3] = 1.0f;
+    const auto defaultHeap = MakeHeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    m_sceneColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    CheckHR(m_d3dDevice->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+        &texture, m_sceneColorState, &clear, IID_PPV_ARGS(&m_sceneColor)),
+        "Create HDR scene-color target");
+
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+    rtv.Format = kSceneColorFormat;
+    rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    m_d3dDevice->CreateRenderTargetView(m_sceneColor.Get(), &rtv, GetSceneColorRTV());
+    m_gbuffer->SetSceneColor(m_sceneColor.Get(), kSceneColorFormat);
+
+    D3D12_RESOURCE_DESC exposureTexture = Tex2DDesc(1, 1, kExposureFormat);
+    exposureTexture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE exposureClear{};
+    exposureClear.Format = kExposureFormat;
+    exposureClear.Color[0] = 1.0f;
+    for (uint32_t index = 0; index < GBuffer::kExposureCount; ++index)
+    {
+        m_exposureMaps[index].Reset();
+        m_exposureStates[index] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        CheckHR(m_d3dDevice->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+            &exposureTexture, m_exposureStates[index], &exposureClear,
+            IID_PPV_ARGS(&m_exposureMaps[index])), "Create eye-adaptation history target");
+        m_d3dDevice->CreateRenderTargetView(
+            m_exposureMaps[index].Get(), nullptr, GetExposureRTV(index));
+        m_gbuffer->SetExposureMap(
+            index, m_exposureMaps[index].Get(), kExposureFormat);
+    }
+    m_exposureWriteIndex = 0;
+    m_resetExposure = true;
+    return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  CreateRootSignature — slot0: CBV table, slot1: SRV table + static sampler
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2110,6 +2296,27 @@ bool RenderingSystem::CreateRootSignatures()
     create(shadow, 3, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
         m_shadowRootSig);
 
+    D3D12_DESCRIPTOR_RANGE postProcessRange{};
+    postProcessRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    postProcessRange.NumDescriptors = GBuffer::kSceneColorSrvIndex + 1;
+    postProcessRange.BaseShaderRegister = 0;
+    D3D12_DESCRIPTOR_RANGE exposureRange{};
+    exposureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    exposureRange.NumDescriptors = 1;
+    exposureRange.BaseShaderRegister = 4;
+    D3D12_ROOT_PARAMETER postProcess[3]{};
+    postProcess[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    postProcess[0].DescriptorTable = { 1, &postProcessRange };
+    postProcess[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    postProcess[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    postProcess[1].DescriptorTable = { 1, &exposureRange };
+    postProcess[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    postProcess[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    postProcess[2].Constants = { 0, 0, 8 };
+    postProcess[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    create(postProcess, 3, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        m_postProcessRootSig);
+
     return true;
 }
 
@@ -2195,7 +2402,7 @@ bool RenderingSystem::CreatePipelines()
     directional.SampleMask = UINT_MAX;
     directional.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     directional.NumRenderTargets = 1;
-    directional.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    directional.RTVFormats[0] = kSceneColorFormat;
     directional.SampleDesc.Count = 1;
     CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&directional,
         IID_PPV_ARGS(&m_directionalPso)), "Create directional-light PSO");
@@ -2220,6 +2427,23 @@ bool RenderingSystem::CreatePipelines()
     local.InputLayout = { m_vertexLayout, 1 };
     CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&local,
         IID_PPV_ARGS(&m_localLightPso)), "Create local-light volume PSO");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC eyeAdaptation = directional;
+    eyeAdaptation.pRootSignature = m_postProcessRootSig.Get();
+    eyeAdaptation.VS = { m_fullscreenVs->GetBufferPointer(), m_fullscreenVs->GetBufferSize() };
+    eyeAdaptation.PS = { m_eyeAdaptationPs->GetBufferPointer(),
+        m_eyeAdaptationPs->GetBufferSize() };
+    eyeAdaptation.RTVFormats[0] = kExposureFormat;
+    CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&eyeAdaptation,
+        IID_PPV_ARGS(&m_eyeAdaptationPso)), "Create eye-adaptation PSO");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC postProcess = directional;
+    postProcess.pRootSignature = m_postProcessRootSig.Get();
+    postProcess.VS = { m_fullscreenVs->GetBufferPointer(), m_fullscreenVs->GetBufferSize() };
+    postProcess.PS = { m_postProcessPs->GetBufferPointer(), m_postProcessPs->GetBufferSize() };
+    postProcess.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    CheckHR(m_d3dDevice->CreateGraphicsPipelineState(&postProcess,
+        IID_PPV_ARGS(&m_postProcessPso)), "Create post-process PSO");
 
     D3D12_RASTERIZER_DESC shadowRasterizer = rast;
     shadowRasterizer.CullMode = D3D12_CULL_MODE_NONE;
@@ -2291,7 +2515,7 @@ void RenderingSystem::DrawImGui()
     ImGui::NewFrame();
 
     ImGui::SetNextWindowPos(ImVec2(18.f, 18.f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(365.f, 520.f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(365.f, 650.f), ImGuiCond_FirstUseEver);
     ImGui::Begin("Scene laboratory", nullptr);
 
     if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
@@ -2358,6 +2582,19 @@ void RenderingSystem::DrawImGui()
             m_cascadeSplits.x, m_cascadeSplits.y, m_cascadeSplits.z);
         ImGui::TextDisabled("3 cascades, 2048 px, 3x3 PCF");
         ImGui::TextDisabled("World-anchored and texel-snapped light grid");
+    }
+
+    if (ImGui::CollapsingHeader("Post effects", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::Checkbox("Eye adaptation", &m_eyeAdaptationEnabled);
+        ImGui::SliderFloat("Exposure key", &m_exposureKey, 0.03f, 0.25f, "%.2f");
+        ImGui::Checkbox("Vignetting", &m_vignetteEnabled);
+        ImGui::SliderFloat("Vignette strength", &m_vignetteStrength, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Vignette inner", &m_vignetteInnerRadius, 0.0f, 1.5f, "%.2f");
+        ImGui::SliderFloat("Vignette outer", &m_vignetteOuterRadius, 0.1f, 2.5f, "%.2f");
+        m_vignetteOuterRadius = std::max(
+            m_vignetteOuterRadius, m_vignetteInnerRadius + 0.01f);
+        ImGui::TextDisabled("Effects can be enabled independently.");
     }
 
     ImGui::Separator();

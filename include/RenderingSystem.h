@@ -87,6 +87,8 @@ private:
     static constexpr uint32_t kShadowMapResolution = 2048;
     static constexpr float kCameraNear = 0.5f;
     static constexpr float kCameraFar = 180.0f;
+    static constexpr DXGI_FORMAT kSceneColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    static constexpr DXGI_FORMAT kExposureFormat = DXGI_FORMAT_R16_FLOAT;
 
     struct alignas(16) FrameConstants
     {
@@ -96,7 +98,7 @@ private:
         DirectX::XMFLOAT4X4 InverseViewProjection;
         DirectX::XMFLOAT4X4 CascadeViewProjection[kShadowCascadeCount];
         DirectX::XMFLOAT4 CascadeSplits{};
-        DirectX::XMFLOAT3 CameraPosition; float Ambient = 0.09f;
+        DirectX::XMFLOAT3 CameraPosition; float Ambient = 0.025f;
         DirectX::XMFLOAT3 DirectionalDirection; float DirectionalIntensity = 1.f;
         DirectX::XMFLOAT3 DirectionalColor{ 1.f, 0.96f, 0.88f }; float Padding0 = 0.f;
         DirectX::XMFLOAT2 TextureTiling{ 1.f, 1.f };
@@ -112,6 +114,7 @@ private:
     bool CreateMesh();
     bool CreateFrameResources();
     bool CreateShadowResources();
+    bool CreatePostProcessResources();
     bool CreateRootSignatures();
     bool CreatePipelines();
     bool CreateLightVolume();
@@ -133,9 +136,13 @@ private:
     void RecordGeometryPass();
     void RecordDirectionalPass(D3D12_CPU_DESCRIPTOR_HANDLE target);
     void RecordLocalLightPass(D3D12_CPU_DESCRIPTOR_HANDLE target);
+    void RecordEyeAdaptationPass();
+    void RecordPostProcessPass(D3D12_CPU_DESCRIPTOR_HANDLE target);
     void WaitForGpu();
 
     D3D12_CPU_DESCRIPTOR_HANDLE GetActiveRTV() const;
+    D3D12_CPU_DESCRIPTOR_HANDLE GetSceneColorRTV() const;
+    D3D12_CPU_DESCRIPTOR_HANDLE GetExposureRTV(uint32_t index) const;
     ID3D12Resource* GetActiveBackBuffer() const;
 
     bool m_ready = false;
@@ -169,6 +176,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_tessellationRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightingRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_shadowRootSig;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_postProcessRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_geometryWireframePso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_instancedGeometryPso;
@@ -177,6 +185,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_directionalPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_localLightPso;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_eyeAdaptationPso;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_postProcessPso;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_instancedGeometryVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_geometryPs;
@@ -189,6 +199,8 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightVs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_localLightPs;
     Microsoft::WRL::ComPtr<ID3DBlob> m_shadowVs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_eyeAdaptationPs;
+    Microsoft::WRL::ComPtr<ID3DBlob> m_postProcessPs;
     D3D12_INPUT_ELEMENT_DESC m_vertexLayout[3]{};
     D3D12_INPUT_ELEMENT_DESC m_instancedVertexLayout[7]{};
 
@@ -239,12 +251,23 @@ private:
     DirectX::XMFLOAT4 m_cascadeSplits{};
     DirectX::BoundingBox m_sceneBounds{};
 
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_sceneColor;
+    D3D12_RESOURCE_STATES m_sceneColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, GBuffer::kExposureCount> m_exposureMaps;
+    std::array<D3D12_RESOURCE_STATES, GBuffer::kExposureCount> m_exposureStates{
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    };
+    uint32_t m_exposureWriteIndex = 0;
+    bool m_resetExposure = true;
+
     DirectX::XMFLOAT4X4 m_worldMatrix{};
     DirectX::XMFLOAT4X4 m_viewMatrix{};
     DirectX::XMFLOAT4X4 m_projMatrix{};
     DirectX::XMFLOAT3 m_cameraPos{ -4.f, 1.5f, -4.f };
     DirectX::XMFLOAT3 m_sunDirection{ 0.45f, -0.82f, 0.35f };
     float m_textureTime = 0.f;
+    float m_frameDeltaTime = 0.f;
     float m_particleTime = 0.f;
     float m_particleDeltaTime = 0.f;
     DirectX::XMFLOAT3 m_particleEmitter{ 0.f, 0.4f, 0.f };
@@ -264,5 +287,11 @@ private:
     float m_maxTessellation = 6.0f;
     float m_tessellationNearDistance = 2.0f;
     float m_tessellationFarDistance = 18.0f;
+    bool m_eyeAdaptationEnabled = true;
+    bool m_vignetteEnabled = true;
+    float m_exposureKey = 0.10f;
+    float m_vignetteStrength = 0.65f;
+    float m_vignetteInnerRadius = 0.35f;
+    float m_vignetteOuterRadius = 1.15f;
     bool m_imguiReady = false;
 };

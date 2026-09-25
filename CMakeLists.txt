@@ -78,6 +78,9 @@ add_custom_command(TARGET Lab4 POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/Particle.hlsl"
         "$<TARGET_FILE_DIR:Lab4>/Particle.hlsl"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/PostProcess.hlsl"
+        "$<TARGET_FILE_DIR:Lab4>/PostProcess.hlsl"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/sponza.obj"
         "$<TARGET_FILE_DIR:Lab4>/sponza.obj"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

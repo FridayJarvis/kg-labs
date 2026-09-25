@@ -14,6 +14,11 @@ public:
     enum class Target : uint32_t { Albedo = 0, Normal = 1, Depth = 2, Count = 3 };
     static constexpr uint32_t kColorTargetCount = 2;
     static constexpr uint32_t kShaderTargetCount = 3;
+    static constexpr uint32_t kSceneColorSrvIndex = kShaderTargetCount;
+    static constexpr uint32_t kShadowSrvIndex = kSceneColorSrvIndex + 1;
+    static constexpr uint32_t kExposureSrvIndex = kShadowSrvIndex + 1;
+    static constexpr uint32_t kExposureCount = 2;
+    static constexpr uint32_t kSrvCount = kExposureSrvIndex + kExposureCount;
 
     GBuffer() = default;
     GBuffer(ID3D12Device* device, uint32_t width, uint32_t height);
@@ -29,8 +34,12 @@ public:
     D3D12_CPU_DESCRIPTOR_HANDLE DepthDsv() const;
     ID3D12DescriptorHeap* SrvHeap() const { return m_srvHeap.Get(); }
     D3D12_GPU_DESCRIPTOR_HANDLE SrvTable() const;
+    D3D12_GPU_DESCRIPTOR_HANDLE SceneColorSrv() const;
     D3D12_GPU_DESCRIPTOR_HANDLE ShadowSrv() const;
+    D3D12_GPU_DESCRIPTOR_HANDLE ExposureSrv(uint32_t index) const;
+    void SetSceneColor(ID3D12Resource* sceneColor, DXGI_FORMAT format);
     void SetShadowMap(ID3D12Resource* shadowMap, uint32_t cascadeCount);
+    void SetExposureMap(uint32_t index, ID3D12Resource* exposureMap, DXGI_FORMAT format);
 
     static constexpr DXGI_FORMAT AlbedoFormat() { return DXGI_FORMAT_R8G8B8A8_UNORM; }
     static constexpr DXGI_FORMAT NormalFormat() { return DXGI_FORMAT_R16G16B16A16_FLOAT; }

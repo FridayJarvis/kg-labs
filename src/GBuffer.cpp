@@ -63,10 +63,9 @@ void GBuffer::CreateHeaps()
 
     D3D12_DESCRIPTOR_HEAP_DESC srv{};
     srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    // The fourth slot is reserved for the cascaded shadow-map array.  Keeping
-    // it in this heap lets the lighting pass bind all sampled textures through
+    // The G-buffer attachments, lit scene color, and cascaded shadow map share
     // the single shader-visible CBV/SRV/UAV heap allowed by D3D12.
-    srv.NumDescriptors = kShaderTargetCount + 1;
+    srv.NumDescriptors = kSrvCount;
     srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Require(m_device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&m_srvHeap)), "Create G-buffer SRV heap");
 }
@@ -189,8 +188,37 @@ D3D12_GPU_DESCRIPTOR_HANDLE GBuffer::SrvTable() const
 D3D12_GPU_DESCRIPTOR_HANDLE GBuffer::ShadowSrv() const
 {
     auto handle = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<UINT64>(kShaderTargetCount) * m_srvStride;
+    handle.ptr += static_cast<UINT64>(kShadowSrvIndex) * m_srvStride;
     return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GBuffer::SceneColorSrv() const
+{
+    auto handle = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(kSceneColorSrvIndex) * m_srvStride;
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GBuffer::ExposureSrv(uint32_t index) const
+{
+    auto handle = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(kExposureSrvIndex + index) * m_srvStride;
+    return handle;
+}
+
+void GBuffer::SetSceneColor(ID3D12Resource* sceneColor, DXGI_FORMAT format)
+{
+    if (!m_device || !m_srvHeap || !sceneColor) return;
+
+    auto handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(kSceneColorSrvIndex) * m_srvStride;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Format = format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(sceneColor, &view, handle);
 }
 
 void GBuffer::SetShadowMap(ID3D12Resource* shadowMap, uint32_t cascadeCount)
@@ -198,7 +226,7 @@ void GBuffer::SetShadowMap(ID3D12Resource* shadowMap, uint32_t cascadeCount)
     if (!m_device || !m_srvHeap || !shadowMap || cascadeCount == 0) return;
 
     auto handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-    handle.ptr += static_cast<SIZE_T>(kShaderTargetCount) * m_srvStride;
+    handle.ptr += static_cast<SIZE_T>(kShadowSrvIndex) * m_srvStride;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -209,4 +237,20 @@ void GBuffer::SetShadowMap(ID3D12Resource* shadowMap, uint32_t cascadeCount)
     view.Texture2DArray.FirstArraySlice = 0;
     view.Texture2DArray.ArraySize = cascadeCount;
     m_device->CreateShaderResourceView(shadowMap, &view, handle);
+}
+
+void GBuffer::SetExposureMap(uint32_t index, ID3D12Resource* exposureMap,
+    DXGI_FORMAT format)
+{
+    if (!m_device || !m_srvHeap || !exposureMap || index >= kExposureCount) return;
+
+    auto handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(kExposureSrvIndex + index) * m_srvStride;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Format = format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MipLevels = 1;
+    m_device->CreateShaderResourceView(exposureMap, &view, handle);
 }
